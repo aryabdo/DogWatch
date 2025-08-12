@@ -69,6 +69,7 @@ load_env() {
   export JQ_BIN="${JQ_BIN:-$(command -v jq || echo /usr/bin/jq)}"
   export RSYNC_BIN="${RSYNC_BIN:-$(command -v rsync || echo /usr/bin/rsync)}"
   export SYSCTL_BIN="${SYSCTL_BIN:-$(command -v sysctl || echo /usr/sbin/sysctl)}"
+  export PUBLIC_IP_SERVICE="${PUBLIC_IP_SERVICE:-https://ifconfig.me}"
 
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE" || true
   detect_firewalls
@@ -337,6 +338,24 @@ has_outbound_internet() {
   return 1
 }
 
+has_remote_access() {
+  # Verifica se portas obrigatórias estão acessíveis via IP público
+  local ip
+  ip="$($CURL_BIN -fsS "$PUBLIC_IP_SERVICE" 2>/dev/null || echo)"
+  [[ -z "$ip" ]] && { log DEBUG "Falha ao obter IP público"; return 1; }
+  local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
+  ports="$(echo $ports)"
+  for p in $ports; do
+    if $NC_BIN -w2 -z "$ip" "$p" >/dev/null 2>&1; then
+      log DEBUG "Porta remota OK: $ip:$p"
+    else
+      log DEBUG "Porta remota falhou: $ip:$p"
+      return 1
+    fi
+  done
+  return 0
+}
+
 listening_on_ports() {
   local ports="$*"
   local missing=()
@@ -535,12 +554,12 @@ reset_remote_access() {
 detect_external_vs_internal() {
   # Retorna 0 se parece externo, 1 se interno
   # Heurística: sem internet de saída E hash de configs não mudou => externo
-  # Se hash mudou OU firewall/sshd listening problem => interno
+  # Se hash mudou OU firewall/sshd listening problem OU acesso remoto falhou => interno
   if has_outbound_internet; then
-    # Tem internet: se portas não estão abertas/listening ou firewall bloqueia => interno
+    # Tem internet: se portas não estão abertas/listening, firewall bloqueia ou acesso remoto falha => interno
     local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
     ports="$(echo $ports)"
-    if listening_on_ports $ports && firewall_allows_ports $ports; then
+    if listening_on_ports $ports && firewall_allows_ports $ports && has_remote_access; then
       # Tudo parece ok
       echo "normal"
       return 2
@@ -572,6 +591,12 @@ status_report() {
     echo -e "${green}Internet de saída: OK${reset}"
   else
     echo -e "${red}Internet de saída: FALHA - verifique conexão/DNS${reset}"
+  fi
+
+  if has_remote_access; then
+    echo -e "${green}Acesso remoto: OK${reset}"
+  else
+    echo -e "${red}Acesso remoto: FALHA - possível IP/porta incorreta${reset}"
   fi
 
   local missing_ports
@@ -618,7 +643,7 @@ attempt_restore_chain() {
     restore_snapshot "$s" || true
     sleep 5
     # Revalida conectividade
-    if has_outbound_internet && listening_on_ports $ports; then
+    if has_outbound_internet && listening_on_ports $ports && has_remote_access; then
       log INFO "Conectividade restaurada com snapshot: $s"
       # Atualiza last_good.hash
       compute_current_hash > "$STATE_DIR/last_good.hash" || true

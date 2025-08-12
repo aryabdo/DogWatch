@@ -2,6 +2,7 @@
 Description=DogWatch daemon
 After=network.target
 StartLimitIntervalSec=0
+StartLimitBurst=0
 
 Wants=network-online.target
 
