@@ -343,7 +343,7 @@ firewall_allows_ports() {
     local status
     status="$(ufw status | tr '[:upper:]' '[:lower:]')"
     for p in $ports; do
-      if echo "$status" | grep -qE "\\b$ p/tcp\\b.*allow|\\b$ p\\b.*allow"; then
+      if echo "$status" | grep -qE "\\b${p}/tcp\\b.*allow|\\b${p}\\b.*allow"; then
         : # permitido
       else
         # não temos certeza; marcamos como potencialmente bloqueado
