@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -21,6 +21,19 @@ require_root() {
     echo "Este script deve ser executado como root."
     exit 1
   fi
+}
+
+# ------------- Firewall detection -------------
+detect_firewalls() {
+  local detected=()
+  command -v ufw >/dev/null 2>&1 && detected+=(ufw)
+  systemctl list-unit-files 2>/dev/null | grep -q '^firewalld.service' && detected+=(firewalld)
+  command -v nft >/dev/null 2>&1 && detected+=(nftables)
+  command -v iptables >/dev/null 2>&1 && detected+=(iptables)
+  FIREWALLS="${FIREWALLS:-}"
+  FIREWALLS="${FIREWALLS:+$FIREWALLS }${detected[*]}"
+  FIREWALLS="$(echo $FIREWALLS | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+  export FIREWALLS
 }
 
 # ------------- Defaults/Paths -------------
@@ -49,7 +62,7 @@ load_env() {
   export MONITOR_INTERVAL_SECONDS="${MONITOR_INTERVAL_SECONDS:-300}"
   export BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-1800}"
   export MAX_ROTATING_BACKUPS="${MAX_ROTATING_BACKUPS:-10}"
-  export FIREWALLS="${FIREWALLS:-"ufw firewalld"}"
+  export FIREWALLS="${FIREWALLS:-"ufw firewalld nftables iptables"}"
   export AGGRESSIVE_REPAIR="${AGGRESSIVE_REPAIR:-1}"
   export CURL_BIN="${CURL_BIN:-$(command -v curl || echo /usr/bin/curl)}"
   export NC_BIN="${NC_BIN:-$(command -v nc || echo /usr/bin/nc)}"
@@ -58,6 +71,7 @@ load_env() {
   export SYSCTL_BIN="${SYSCTL_BIN:-$(command -v sysctl || echo /usr/sbin/sysctl)}"
 
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE" || true
+  detect_firewalls
 
   mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$LOG_DIR" "$STATE_DIR"
   chmod 700 "$DATA_DIR" "$BACKUP_DIR" "$STATE_DIR" || true
@@ -96,7 +110,7 @@ STATE_DIR="$DATA_DIR/state"
 MONITOR_INTERVAL_SECONDS=300
 BACKUP_INTERVAL_SECONDS=1800
 MAX_ROTATING_BACKUPS=10
-FIREWALLS="ufw firewalld"
+FIREWALLS="ufw firewalld nftables iptables"
 AGGRESSIVE_REPAIR=1
 EOF
   fi
@@ -278,11 +292,7 @@ restore_snapshot() {
   fi
   systemctl restart systemd-networkd 2>/dev/null || true
   systemctl restart NetworkManager 2>/dev/null || true
-  systemctl restart ssh || true
-  ufw reload 2>/dev/null || true
-  systemctl restart firewalld 2>/dev/null || true
-  # Garante portas obrigatórias
-  ensure_ports_open
+  reset_remote_access
 }
 
 compute_current_hash() {
@@ -352,23 +362,54 @@ listening_on_ports() {
 firewall_allows_ports() {
   local ports="$*"
   local blocked=()
-  # UFW
-  if command -v ufw >/dev/null 2>&1; then
-    local status
-    status="$(ufw status | tr '[:upper:]' '[:lower:]')"
-    if ! echo "$status" | grep -q "inactive"; then
-      for p in $ports; do
-        if echo "$status" | grep -qE "\\b${p}/tcp\\b.*allow|\\b${p}\\b.*allow"; then
-          : # permitido
-        else
-          blocked+=("$p")
+  for fw in $FIREWALLS; do
+    case "$fw" in
+      ufw)
+        if command -v ufw >/dev/null 2>&1; then
+          local status
+          status="$(ufw status | tr '[:upper:]' '[:lower:]')"
+          if ! echo "$status" | grep -q "inactive"; then
+            for p in $ports; do
+              if echo "$status" | grep -qE "\\b${p}/tcp\\b.*allow|\\b${p}\\b.*allow"; then
+                :
+              else
+                blocked+=("$p")
+              fi
+            done
+          fi
         fi
-      done
-    fi
-  fi
-  # Não conclusivo para nft/iptables; retornamos 0 se desconhecido
+        ;;
+      firewalld)
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+          local plist
+          plist="$(firewall-cmd --permanent --list-ports 2>/dev/null || true)"
+          for p in $ports; do
+            echo "$plist" | grep -qw "${p}/tcp" || blocked+=("$p")
+          done
+        fi
+        ;;
+      nftables)
+        if command -v nft >/dev/null 2>&1; then
+          local rules
+          rules="$(nft list ruleset 2>/dev/null || true)"
+          for p in $ports; do
+            echo "$rules" | grep -qw "dport $p" || blocked+=("$p")
+          done
+        fi
+        ;;
+      iptables)
+        if command -v iptables >/dev/null 2>&1; then
+          local rules
+          rules="$(iptables -L INPUT -n 2>/dev/null || true)"
+          for p in $ports; do
+            echo "$rules" | grep -qw "dpt:$p" || blocked+=("$p")
+          done
+        fi
+        ;;
+    esac
+  done
   if (( ${#blocked[@]} > 0 )); then
-    log DEBUG "Portas potencialmente bloqueadas no UFW: ${blocked[*]}"
+    log DEBUG "Portas potencialmente bloqueadas nos firewalls: ${blocked[*]}"
     return 1
   fi
   return 0
@@ -377,39 +418,108 @@ firewall_allows_ports() {
 ensure_ports_open() {
   local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
   ports="$(echo $ports)" # normaliza espaços
-  # UFW
-  if command -v ufw >/dev/null 2>&1; then
-    ufw --force enable || true
-    for p in $ports; do
-      ufw allow "$p/tcp" || true
-    done
-  fi
-  # Firewalld
-  if systemctl is-active --quiet firewalld 2>/dev/null; then
-    for p in $ports; do
-      firewall-cmd --add-port="$p/tcp" --permanent || true
-      firewall-cmd --reload || true
-    done
-  fi
-  # nftables (mínimo)
-  if command -v nft >/dev/null 2>&1; then
-    for p in $ports; do
-      nft add rule inet filter input tcp dport "$p" accept 2>/dev/null || true
-    done
-    nft list ruleset >/etc/nftables.conf 2>/dev/null || true
-    systemctl restart nftables 2>/dev/null || true
-  fi
+  for fw in $FIREWALLS; do
+    case "$fw" in
+      ufw)
+        if command -v ufw >/dev/null 2>&1; then
+          ufw --force enable || true
+          for p in $ports; do
+            ufw allow "$p/tcp" || true
+          done
+        fi
+        ;;
+      firewalld)
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+          for p in $ports; do
+            firewall-cmd --add-port="$p/tcp" --permanent || true
+            firewall-cmd --reload || true
+          done
+        fi
+        ;;
+      nftables)
+        if command -v nft >/dev/null 2>&1; then
+          for p in $ports; do
+            nft add rule inet filter input tcp dport "$p" accept 2>/dev/null || true
+          done
+          nft list ruleset >/etc/nftables.conf 2>/dev/null || true
+          systemctl restart nftables 2>/dev/null || true
+        fi
+        ;;
+      iptables)
+        if command -v iptables >/dev/null 2>&1; then
+          for p in $ports; do
+            iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$p" -j ACCEPT || true
+          done
+          iptables-save >/etc/iptables/rules.v4 2>/dev/null || true
+        fi
+        ;;
+    esac
+  done
 }
 
 safe_disable_firewalls() {
   # Desativa firewalls se atrapalham conectividade (apenas durante restauração)
-  if command -v ufw >/dev/null 2>&1; then
-    ufw --force disable || true
+  for fw in $FIREWALLS; do
+    case "$fw" in
+      ufw)
+        command -v ufw >/dev/null 2>&1 && ufw --force disable || true
+        ;;
+      firewalld)
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+          systemctl stop firewalld || true
+          systemctl disable firewalld || true
+        fi
+        ;;
+      nftables)
+        command -v nft >/dev/null 2>&1 && nft flush ruleset 2>/dev/null || true
+        ;;
+      iptables)
+        command -v iptables >/dev/null 2>&1 && iptables -F 2>/dev/null || true
+        ;;
+    esac
+  done
+}
+
+reset_remote_access() {
+  load_env
+  # Garantir acesso SSH por senha de qualquer IP e limpar bloqueios
+  if [[ -f /etc/ssh/sshd_config ]]; then
+    sed -i '/^PasswordAuthentication/d;/^PermitRootLogin/d;/^AllowUsers/d;/^DenyUsers/d;/^AllowGroups/d;/^DenyGroups/d;/^ListenAddress/d' /etc/ssh/sshd_config
+    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
   fi
-  if systemctl is-active --quiet firewalld 2>/dev/null; then
-    systemctl stop firewalld || true
-    systemctl disable firewalld || true
+  : > /etc/hosts.deny || true
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    fail2ban-client unban --all || true
   fi
+  if command -v passwd >/dev/null 2>&1; then
+    passwd -u root 2>/dev/null || true
+  fi
+  for fw in $FIREWALLS; do
+    case "$fw" in
+      ufw)
+        command -v ufw >/dev/null 2>&1 && ufw --force reset || true
+        ;;
+      firewalld)
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+          firewall-cmd --permanent --delete-all-rich-rules 2>/dev/null || true
+          firewall-cmd --permanent --delete-all-rules 2>/dev/null || true
+          firewall-cmd --reload 2>/dev/null || true
+        fi
+        ;;
+      nftables)
+        command -v nft >/dev/null 2>&1 && nft flush ruleset 2>/dev/null || true
+        ;;
+      iptables)
+        if command -v iptables >/dev/null 2>&1; then
+          iptables -F 2>/dev/null || true
+          iptables -X 2>/dev/null || true
+        fi
+        ;;
+    esac
+  done
+  ensure_ports_open
+  systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
 }
 
 detect_external_vs_internal() {
