@@ -1,0 +1,19 @@
+[Unit]
+Description=DogWatch - Monitoramento de Conectividade e Autorreparo
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/dogwatch/dogwatch.sh daemon
+Restart=always
+RestartSec=5s
+EnvironmentFile=-/etc/dogwatch/config.env
+# Garante PATH padrão de root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Limita logs por burst para evitar flooding
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target
