@@ -32,7 +32,7 @@ main() {
   fi
 
   systemctl enable --now dogwatch.service
-  echo "[dogwatch] Instalação concluída. Use: /opt/dogwatch/dogwatch.sh --menu"
+  echo "[dogwatch] Instalação concluída. Use: /opt/dogwatch/dogwatch.sh"
 }
 
 main "$@"

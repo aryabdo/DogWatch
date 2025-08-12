@@ -44,8 +44,7 @@ sudo /opt/dogwatch/dogwatch.sh uninstall
 ## Componentes
 - `dogwatch.sh` — Daemon + CLI/menu.
 - `dogwatch.service` — Serviço systemd (inicia no boot; reinicia se cair).
-- `config.env.example` — Exemplo de configuração; na instalação vira `/etc/dogwatch/config.env` (ou copie manualmente).
-- `dogwatch.env` — Alternativa para instalação automática do arquivo de configuração.
+- `config.env.example` — Exemplo copiado para `/etc/dogwatch/config.env` na instalação; ajuste depois conforme necessário.
 - `install.sh` — Instalador que pode instalar a partir deste repositório ou via one-liner.
 - `Makefile` — Atalhos (install/uninstall/menu/status/logs/pkg).
 
@@ -60,7 +59,7 @@ Logs: `/var/log/dogwatch/dogwatch.log`
   - **external** (falha do provedor/rota): **não altera** o sistema.
   - **internal** (mudança local): **restauração automática** do snapshot mais novo → mais antigo (inclui 0.0), validando conexão após cada passo.
 - **Garante portas**: `22` e **`16309`** sempre abertas; pode desativar firewalls temporariamente para restaurar conectividade.
-- **Menu interativo** (`--menu`): backups, restauração, portas, firewalls, listas (UFW), diagnósticos, speedtest, editar config, etc.
+- **Menu interativo**: execute `dogwatch.sh` sem argumentos para backups, restauração, portas, firewalls, listas (UFW), diagnósticos, speedtest, editar config, etc.
 
 > **Atenção**: Atua assertivamente em componentes de rede/segurança. Tenha console físico/virtual para contingência.
 
