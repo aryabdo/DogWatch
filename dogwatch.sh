@@ -77,7 +77,9 @@ install_self() {
   say "Instalando arquivos..."
   mkdir -p "$DATA_DIR"
   install -m 0755 "$(realpath "$0")" "$DATA_DIR/$PROG.sh"
-  [[ -f "./$PROG.env" ]] && install -m 0644 "./$PROG.env" "$ENV_FILE" || {
+  if [[ -f ./config.env.example ]]; then
+    install -m 0644 ./config.env.example "$ENV_FILE"
+  else
     mkdir -p "$(dirname "$ENV_FILE")"
     cat > "$ENV_FILE" <<'EOF'
 MANDATORY_OPEN_PORTS="22 16309"
@@ -97,7 +99,7 @@ MAX_ROTATING_BACKUPS=10
 FIREWALLS="ufw firewalld"
 AGGRESSIVE_REPAIR=1
 EOF
-  }
+  fi
 
   install -m 0644 "./$PROG.service" "/etc/systemd/system/$PROG.service"
   systemctl daemon-reload
@@ -425,6 +427,44 @@ detect_external_vs_internal() {
   fi
 }
 
+status_report() {
+  load_env
+  local green='\033[32m' yellow='\033[33m' red='\033[31m' reset='\033[0m'
+  local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
+  ports="$(echo $ports)"
+
+  if has_outbound_internet; then
+    echo -e "${green}Internet de saída: OK${reset}"
+  else
+    echo -e "${red}Internet de saída: FALHA - verifique conexão/DNS${reset}"
+  fi
+
+  if listening_on_ports $ports; then
+    echo -e "${green}Portas ouvindo: $ports${reset}"
+  else
+    echo -e "${red}Portas não estão ouvindo: $ports - iniciar serviços ou ajustar firewall${reset}"
+  fi
+
+  if firewall_allows_ports $ports; then
+    echo -e "${green}Firewall permite portas necessárias${reset}"
+  else
+    echo -e "${yellow}Firewall bloqueando portas - execute ensure-ports${reset}"
+  fi
+
+  local state="$(detect_external_vs_internal || true)"
+  case "$state" in
+    normal)
+      echo -e "${green}Status geral: normal${reset}"
+      ;;
+    internal)
+      echo -e "${red}Status geral: interno - verificar serviços/firewall ou restaurar backup${reset}"
+      ;;
+    external)
+      echo -e "${yellow}Status geral: external - possível falha de provedor/rota${reset}"
+      ;;
+  esac
+}
+
 attempt_restore_chain() {
   # Tenta restaurar do mais novo ao mais antigo; inclui 000-initial por último
   load_env
@@ -506,6 +546,8 @@ menu() {
   load_env
   while true; do
     clear
+    status_report
+    echo
     cat <<EOF
 ================= DOGWATCH (v$VERSION) =================
 1) Status geral
@@ -530,8 +572,7 @@ EOF
         echo "Status serviço:"
         systemctl status "$PROG.service" --no-pager || true
         echo
-        echo "Conectividade:"
-        detect_external_vs_internal || true
+        status_report
         read -rp "Enter para continuar..." _ ;;
       2)
         echo "Pressione Ctrl+C para sair."
@@ -613,6 +654,8 @@ EOF
         esac
         read -rp "Enter para continuar..." _ ;;
       9)
+        status_report
+        echo
         echo "Ping/HTTP:"
         has_outbound_internet && echo "Internet de saída: OK" || echo "Internet de saída: FALHA"
         echo "Listening (ss):"; ss -lntup || true
@@ -643,8 +686,8 @@ case "${1:-}" in
   restore) restore_snapshot "${2:-}";;
   list-backups) list_backups ;;
   ensure-ports) ensure_ports_open ;;
-  status) detect_external_vs_internal ;;
-  --menu|menu) menu ;;
+  status) status_report ;;
+  "") menu ;;
   *)
     cat <<EOF
 $PROG v$VERSION
@@ -658,13 +701,13 @@ Comandos:
   list-backups      Lista snapshots disponíveis
   restore <snap>    Restaura snapshot
   ensure-ports      Garante portas obrigatórias abertas
-  status            Exibe diagnóstico atual (normal/external/internal)
-  --menu | menu     Interface interativa em modo texto
+  status            Exibe diagnóstico atual com cores
+  (sem argumento)   Interface interativa
 
 Exemplos:
   $0 install
-  $0 --menu
-  systemctl enable --now dogwatch.service
+  $0
+  systemctl enable --now $PROG.service
 
 EOF
     ;;

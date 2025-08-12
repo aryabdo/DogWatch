@@ -34,7 +34,7 @@ main() {
   install -m 0644 ./dogwatch.service /etc/systemd/system/dogwatch.service
   systemctl daemon-reload
   systemctl enable --now dogwatch.service
-  echo "[dogwatch] Instalação concluída. Use: /opt/dogwatch/dogwatch.sh --menu"
+  echo "[dogwatch] Instalação concluída. Use: /opt/dogwatch/dogwatch.sh"
 }
 
 main "$@"

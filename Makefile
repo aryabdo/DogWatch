@@ -22,9 +22,9 @@ logs:
 	sudo tail -n 200 -f /var/log/dogwatch/dogwatch.log
 
 menu:
-	sudo /opt/dogwatch/dogwatch.sh --menu
+	sudo /opt/dogwatch/dogwatch.sh
 
 pkg:
 	rm -f dogwatch.tar.gz
-	tar -czf dogwatch.tar.gz dogwatch.sh dogwatch.service config.env.example dogwatch.env install.sh Makefile README.md
+	tar -czf dogwatch.tar.gz dogwatch.sh dogwatch.service config.env.example install.sh Makefile README.md
 	@echo "Pacote gerado: dogwatch.tar.gz"
