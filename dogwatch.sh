@@ -283,15 +283,17 @@ restore_snapshot() {
   # Desabilita firewalls antes de restaurar
   safe_disable_firewalls
 
-  # Restaura arquivos
-  rsync -a "$dir/files/" / 2>/dev/null || true
+  # Restaura arquivos, removendo modificações não rastreadas
+  rsync -a --delete "$dir/files/" / 2>/dev/null || true
 
-  # Aplica netplan e reinicia serviços básicos
+  # Reaplica configurações de rede para garantir conectividade
   if command -v netplan >/dev/null 2>&1; then
+    netplan generate >/dev/null 2>&1 || true
     netplan apply || true
   fi
   systemctl restart systemd-networkd 2>/dev/null || true
   systemctl restart NetworkManager 2>/dev/null || true
+  systemctl restart networking 2>/dev/null || true
   reset_remote_access
 }
 
@@ -457,6 +459,7 @@ ensure_ports_open() {
           for p in $ports; do
             iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$p" -j ACCEPT || true
           done
+          mkdir -p /etc/iptables
           iptables-save >/etc/iptables/rules.v4 2>/dev/null || true
         fi
         ;;
