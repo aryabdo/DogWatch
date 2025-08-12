@@ -58,6 +58,7 @@ Logs: `/var/log/dogwatch/dogwatch.log`
 - **Monitoramento a cada 5 min**: `normal | external | internal`.
   - **external** (falha do provedor/rota): **não altera** o sistema.
   - **internal** (mudança local): **restauração automática** do snapshot mais novo → mais antigo (inclui 0.0), validando conexão após cada passo.
+- **Verifica acesso remoto** ao IP público e reverte para backups caso falhe, mesmo com internet disponível.
 - **Garante portas**: `22` e **`16309`** sempre abertas; detecta firewalls instalados e abre portas necessárias automaticamente.
 - **Recuperação SSH**: habilita login por senha de qualquer IP, limpa blacklists e desbloqueia usuários para restabelecer acesso.
 - **Menu interativo**: execute `dogwatch.sh` sem argumentos para backups, restauração, portas, firewalls, listas (UFW), diagnósticos, speedtest, editar config, etc.
