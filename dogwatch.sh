@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.2"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -306,7 +306,14 @@ compute_current_hash() {
     fi
   done < <(backup_items_list) >> "$tmp" 2>/dev/null || true
 
-  { ufw status verbose 2>/dev/null || true; nft list ruleset 2>/dev/null || true; iptables-save 2>/dev/null || true; ss -lntup 2>/dev/null || true; } >> "$tmp" 2>/dev/null
+  {
+    ufw status verbose 2>/dev/null || true
+    nft list ruleset 2>/dev/null || true
+    iptables-save 2>/dev/null || true
+    ss -lntup 2>/dev/null || true
+    ip a 2>/dev/null || true
+    ip r 2>/dev/null || true
+  } >> "$tmp" 2>/dev/null
   sha256sum "$tmp" | awk '{print $1}'
   rm -f "$tmp"
 }
@@ -646,8 +653,14 @@ daemon_loop() {
     log DEBUG "Diagnóstico: $assessment"
     case "$assessment" in
       normal)
-        # Atualiza last_good.hash quando tudo ok
-        compute_current_hash > "$STATE_DIR/last_good.hash" || true
+      # Aceita alterações manuais apenas se conectividade estiver OK
+      local current_hash last_hash
+      current_hash="$(compute_current_hash || echo x)"
+      last_hash="$(cat "$STATE_DIR/last_good.hash" 2>/dev/null || echo y)"
+      if [[ "$current_hash" != "$last_hash" ]]; then
+        log INFO "Configuração alterada manualmente detectada e aceita."
+        echo "$current_hash" > "$STATE_DIR/last_good.hash"
+      fi
         ;;
       external)
         log WARN "Problema de conectividade parece EXTERNO (provedor/rota). Nenhuma ação tomada."
