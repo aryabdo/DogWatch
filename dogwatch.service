@@ -7,7 +7,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/opt/dogwatch/dogwatch.sh daemon
-Restart=alwaysRestartSec=5
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
