@@ -321,15 +321,29 @@ has_outbound_internet() {
 listening_on_ports() {
   local ports="$*"
   local missing=()
-  for p in $ports; do
-    if ss -lnt | awk '{print $4}' | grep -E "[:.]$p$" -q; then
-      log DEBUG "Listening on $p"
-    else
-      missing+=("$p")
-    fi
-  done
+
+  if command -v ss >/dev/null 2>&1; then
+    for p in $ports; do
+      if ss -lnt "sport = :$p" 2>/dev/null | grep -q "."; then
+        log DEBUG "Listening on $p"
+      else
+        missing+=("$p")
+      fi
+    done
+  else
+    for p in $ports; do
+      if $NC_BIN -z 127.0.0.1 "$p" >/dev/null 2>&1 || \
+         $NC_BIN -z ::1 "$p" >/dev/null 2>&1; then
+        log DEBUG "Listening on $p"
+      else
+        missing+=("$p")
+      fi
+    done
+  fi
+
   if (( ${#missing[@]} > 0 )); then
     log DEBUG "Não está ouvindo em: ${missing[*]}"
+    echo "${missing[*]}"
     return 1
   fi
   return 0
@@ -342,14 +356,15 @@ firewall_allows_ports() {
   if command -v ufw >/dev/null 2>&1; then
     local status
     status="$(ufw status | tr '[:upper:]' '[:lower:]')"
-    for p in $ports; do
-      if echo "$status" | grep -qE "\\b${p}/tcp\\b.*allow|\\b${p}\\b.*allow"; then
-        : # permitido
-      else
-        # não temos certeza; marcamos como potencialmente bloqueado
-        blocked+=("$p")
-      fi
-    done
+    if ! echo "$status" | grep -q "inactive"; then
+      for p in $ports; do
+        if echo "$status" | grep -qE "\\b${p}/tcp\\b.*allow|\\b${p}\\b.*allow"; then
+          : # permitido
+        else
+          blocked+=("$p")
+        fi
+      done
+    fi
   fi
   # Não conclusivo para nft/iptables; retornamos 0 se desconhecido
   if (( ${#blocked[@]} > 0 )); then
@@ -439,10 +454,11 @@ status_report() {
     echo -e "${red}Internet de saída: FALHA - verifique conexão/DNS${reset}"
   fi
 
-  if listening_on_ports $ports; then
+  local missing_ports
+  if missing_ports=$(listening_on_ports $ports); then
     echo -e "${green}Portas ouvindo: $ports${reset}"
   else
-    echo -e "${red}Portas não estão ouvindo: $ports - iniciar serviços ou ajustar firewall${reset}"
+    echo -e "${red}Portas não estão ouvindo: $missing_ports - iniciar serviços ou ajustar firewall${reset}"
   fi
 
   if firewall_allows_ports $ports; then
