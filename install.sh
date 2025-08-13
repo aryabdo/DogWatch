@@ -39,6 +39,13 @@ main() {
   install -m 0644 ./dogwatch.service /etc/systemd/system/dogwatch.service
   systemctl daemon-reload
   systemctl enable --now dogwatch.service
+
+  /opt/dogwatch/dogwatch.sh ensure-ports >/dev/null 2>&1 || true
+  systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn 2>/dev/null | awk -v p=16309 '{gsub(/\[|\]/,"",$4); n=split($4,a,":"); if (a[n]==p){found=1; exit}} END {exit !found}' || \
+      echo "[dogwatch] Aviso: porta 16309 não detectada como aberta" >&2
+  fi
   echo "[dogwatch] Instalação concluída. Use: /opt/dogwatch/dogwatch.sh"
 }
 
