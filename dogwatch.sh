@@ -134,10 +134,33 @@ install_self() {
   load_env
 
   say "Instalando dependências..."
-  apt-get update -y || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    curl jq rsync netcat-openbsd iproute2 ufw wireguard-tools \
-    rclone ddclient dnsutils lsof nmap speedtest-cli > /dev/null
+  local virt
+  virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
+
+  install_pkgs() {
+    local pkgs=("$@")
+    local attempt=0
+    while (( attempt < 2 )); do
+      if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}" >/dev/null; then
+        return 0
+      fi
+      attempt=$((attempt+1))
+      sleep 5
+    done
+    return 1
+  }
+
+  DEBIAN_FRONTEND=noninteractive apt-get update -y || true
+  install_pkgs curl jq rsync netcat-openbsd iproute2 ufw nftables iptables || \
+    log WARN "Falha ao instalar pacotes base"
+
+  if [[ "$virt" == "none" ]]; then
+    if ! install_pkgs wireguard-tools rclone ddclient dnsutils lsof nmap speedtest-cli; then
+      log WARN "Falha ao instalar pacotes extras"
+    fi
+  else
+    log WARN "Ambiente virtual detectado ($virt); pacotes extras não instalados"
+  fi
 
   say "Instalando arquivos..."
   mkdir -p "$DATA_DIR"
@@ -246,7 +269,7 @@ ip a
 ip r
 ss -lntup
 $SYSCTL_BIN -a
-ufw status verbose || true
+LC_ALL=C LANG=C ufw status verbose || true
 nft list ruleset || true
 iptables-save || true
 systemctl status ssh --no-pager || true
@@ -377,7 +400,7 @@ compute_current_hash() {
   done < <(backup_items_list) >> "$tmp" 2>/dev/null || true
 
   {
-    ufw status verbose 2>/dev/null || true
+    LC_ALL=C LANG=C ufw status verbose 2>/dev/null || true
     nft list ruleset 2>/dev/null || true
     iptables-save 2>/dev/null || true
     ss -lntup 2>/dev/null || true
@@ -512,14 +535,10 @@ firewall_allows_ports() {
       ufw)
         if command -v ufw >/dev/null 2>&1; then
           local status
-          status="$(LC_ALL=C ufw status | tr '[:upper:]' '[:lower:]')"
-          if ! echo "$status" | grep -q "inactive"; then
+          status="$(LC_ALL=C LANG=C ufw status numbered 2>/dev/null || true)"
+          if echo "$status" | grep -q '^Status: active'; then
             for p in $ports; do
-              if echo "$status" | grep -qE "\\b${p}/tcp\\b.*allow|\\b${p}\\b.*allow"; then
-                :
-              else
-                blocked+=("$p")
-              fi
+              echo "$status" | awk -v port="${p}/tcp" '$2==port && $3=="ALLOW" {found=1} END {exit !found}' || blocked+=("$p")
             done
           fi
         fi
@@ -562,9 +581,22 @@ firewall_allows_ports() {
 
 init_nft_chain() {
   command -v nft >/dev/null 2>&1 || return 0
-  nft list table inet dogwatch >/dev/null 2>&1 && return 0
-  nft add table inet dogwatch 2>/dev/null || true
-  nft add chain inet dogwatch input '{ type filter hook input priority 0 ; }' 2>/dev/null || true
+  mkdir -p /etc/nftables.d
+  grep -q 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null || echo 'include "/etc/nftables.d/*.nft"' >> /etc/nftables.conf
+  if ! nft list table inet dogwatch >/dev/null 2>&1; then
+    nft add table inet dogwatch 2>/dev/null || true
+    nft add chain inet dogwatch input '{ type filter hook input priority 0 ; policy accept; }' 2>/dev/null || true
+  fi
+  if [[ ! -f /etc/nftables.d/dogwatch.nft ]]; then
+    cat > /etc/nftables.d/dogwatch.nft <<'EOF'
+table inet dogwatch {
+  chain input {
+    type filter hook input priority 0; policy accept;
+  }
+}
+EOF
+    nft -f /etc/nftables.conf >/dev/null 2>&1 || true
+  fi
 }
 
 ensure_ports_open() {
@@ -574,9 +606,9 @@ ensure_ports_open() {
     case "$fw" in
       ufw)
         if command -v ufw >/dev/null 2>&1; then
-          ufw --force enable || true
+          LC_ALL=C LANG=C ufw --force enable || true
           for p in $ports; do
-            ufw allow "$p/tcp" || true
+            LC_ALL=C LANG=C ufw allow "$p/tcp" || true
           done
         fi
         ;;
@@ -591,11 +623,21 @@ ensure_ports_open() {
       nftables)
         if command -v nft >/dev/null 2>&1; then
           init_nft_chain
+          local rules=""
           for p in $ports; do
-            nft add rule inet dogwatch input tcp dport "$p" accept 2>/dev/null || true
+            nft list chain inet dogwatch input 2>/dev/null | grep -qw "tcp dport $p accept" || \
+              nft add rule inet dogwatch input tcp dport "$p" accept 2>/dev/null || true
+            rules+="    tcp dport $p accept\n"
           done
-          nft list ruleset >/etc/nftables.conf 2>/dev/null || true
-          systemctl restart nftables 2>/dev/null || true
+          {
+            echo "table inet dogwatch {"
+            echo "  chain input {"
+            echo "    type filter hook input priority 0; policy accept;"
+            printf "%b" "$rules"
+            echo "  }"
+            echo "}"
+          } > /etc/nftables.d/dogwatch.nft
+          nft -f /etc/nftables.conf >/dev/null 2>&1 || true
         fi
         ;;
       iptables)
@@ -603,8 +645,6 @@ ensure_ports_open() {
           for p in $ports; do
             iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$p" -j ACCEPT || true
           done
-          mkdir -p /etc/iptables
-          iptables-save >/etc/iptables/rules.v4 2>/dev/null || true
         fi
         ;;
     esac
@@ -616,7 +656,7 @@ safe_disable_firewalls() {
   for fw in $FIREWALLS; do
     case "$fw" in
       ufw)
-        command -v ufw >/dev/null 2>&1 && ufw --force disable || true
+        command -v ufw >/dev/null 2>&1 && LC_ALL=C LANG=C ufw --force disable || true
         ;;
       firewalld)
         if systemctl is-active --quiet firewalld 2>/dev/null; then
@@ -625,7 +665,7 @@ safe_disable_firewalls() {
         fi
         ;;
       nftables)
-        command -v nft >/dev/null 2>&1 && nft flush ruleset 2>/dev/null || true
+        command -v nft >/dev/null 2>&1 && nft delete table inet dogwatch 2>/dev/null || true
         ;;
       iptables)
         command -v iptables >/dev/null 2>&1 && iptables -F 2>/dev/null || true
@@ -634,14 +674,20 @@ safe_disable_firewalls() {
   done
 }
 
+ensure_sshd_include() {
+  grep -q '^Include /etc/ssh/sshd_config.d/\*.conf' /etc/ssh/sshd_config 2>/dev/null || \
+    printf '\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> /etc/ssh/sshd_config
+}
+
 reset_remote_access() {
   load_env
-  # Garantir acesso SSH por senha de qualquer IP e limpar bloqueios
-  if [[ -f /etc/ssh/sshd_config ]]; then
-    sed -i '/^PasswordAuthentication/d;/^PermitRootLogin/d;/^AllowUsers/d;/^DenyUsers/d;/^AllowGroups/d;/^DenyGroups/d;/^ListenAddress/d' /etc/ssh/sshd_config
-    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
-    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
-  fi
+  ensure_sshd_include
+  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
+Port $PRIMARY_SSH_PORT
+Port $EMERGENCY_SSH_PORT
+PasswordAuthentication yes
+PermitRootLogin yes
+EOF
   : > /etc/hosts.deny || true
   if command -v fail2ban-client >/dev/null 2>&1; then
     fail2ban-client unban --all || true
@@ -652,7 +698,7 @@ reset_remote_access() {
   for fw in $FIREWALLS; do
     case "$fw" in
       ufw)
-        command -v ufw >/dev/null 2>&1 && ufw --force reset || true
+        command -v ufw >/dev/null 2>&1 && LC_ALL=C LANG=C ufw --force reset || true
         ;;
       firewalld)
         if systemctl is-active --quiet firewalld 2>/dev/null; then
@@ -662,7 +708,7 @@ reset_remote_access() {
         fi
         ;;
       nftables)
-        command -v nft >/dev/null 2>&1 && nft flush ruleset 2>/dev/null || true
+        command -v nft >/dev/null 2>&1 && nft flush table inet dogwatch 2>/dev/null || true
         ;;
       iptables)
         if command -v iptables >/dev/null 2>&1; then
@@ -672,7 +718,7 @@ reset_remote_access() {
         ;;
     esac
   done
-  ensure_ports_open
+  ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
   ssh_safe_reload || true
 }
 
@@ -693,17 +739,16 @@ ssh_safe_reload() {
 
 ssh_set_dual_port_mode() {
   load_env
-  grep -q "^Port $PRIMARY_SSH_PORT" /etc/ssh/sshd_config 2>/dev/null || echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
-  grep -q "^Port $EMERGENCY_SSH_PORT" /etc/ssh/sshd_config 2>/dev/null || echo "Port $EMERGENCY_SSH_PORT" >> /etc/ssh/sshd_config
+  ensure_sshd_include
+  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
+Port $PRIMARY_SSH_PORT
+Port $EMERGENCY_SSH_PORT
+EOF
   ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
   ssh_safe_reload || return 1
   sleep 2
   if $NC_BIN -z 127.0.0.1 "$PRIMARY_SSH_PORT" >/dev/null 2>&1 && \
      $NC_BIN -z 127.0.0.1 "$EMERGENCY_SSH_PORT" >/dev/null 2>&1; then
-    sed -i '/^Port/d' /etc/ssh/sshd_config
-    echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
-    echo "Port $EMERGENCY_SSH_PORT" >> /etc/ssh/sshd_config
-    ssh_safe_reload || return 1
     return 0
   else
     log ERROR "Falha ao validar portas $PRIMARY_SSH_PORT e/ou $EMERGENCY_SSH_PORT"
@@ -714,11 +759,13 @@ ssh_set_dual_port_mode() {
 ssh_set_permissive_mode() {
   local reason="$1"
   load_env
-  sed -i '/^PasswordAuthentication/d;/^PermitRootLogin/d;/^AllowUsers/d;/^Port/d' /etc/ssh/sshd_config 2>/dev/null || true
-  echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
-  echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
-  echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
-  echo "Port $EMERGENCY_SSH_PORT" >> /etc/ssh/sshd_config
+  ensure_sshd_include
+  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
+Port $PRIMARY_SSH_PORT
+Port $EMERGENCY_SSH_PORT
+PasswordAuthentication yes
+PermitRootLogin yes
+EOF
   ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
   ssh_safe_reload || true
   echo "$(date +%s) $EMERGENCY_TTL_HOURS $reason" > "$STATE_DIR/ssh_permissive.mode"
@@ -727,16 +774,18 @@ ssh_set_permissive_mode() {
 
 ssh_set_restricted_mode() {
   load_env
-  sed -i '/^PasswordAuthentication/d;/^PermitRootLogin/d;/^AllowUsers/d;/^Port/d' /etc/ssh/sshd_config 2>/dev/null || true
-  echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
-  echo "PermitRootLogin no" >> /etc/ssh/sshd_config
-  echo "AllowUsers aasn" >> /etc/ssh/sshd_config
-  echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
+  ensure_sshd_include
+  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
+Port $PRIMARY_SSH_PORT
+PasswordAuthentication yes
+PermitRootLogin no
+AllowUsers aasn
+EOF
   ssh_safe_reload || true
   for fw in $FIREWALLS; do
     case "$fw" in
       ufw)
-        command -v ufw >/dev/null 2>&1 && ufw delete allow "$EMERGENCY_SSH_PORT/tcp" >/dev/null 2>&1 || true ;;
+        command -v ufw >/dev/null 2>&1 && LC_ALL=C LANG=C ufw delete allow "$EMERGENCY_SSH_PORT/tcp" >/dev/null 2>&1 || true ;;
       firewalld)
         if systemctl is-active --quiet firewalld 2>/dev/null; then
           firewall-cmd --remove-port="$EMERGENCY_SSH_PORT/tcp" --permanent 2>/dev/null || true
@@ -770,34 +819,48 @@ ssh_check_ttl_and_restrict_if_needed() {
 apply_server_baseline() {
   load_env
   log INFO "Aplicando baseline do servidor"
-  if [[ ! -e /sys/class/net/eno1 ]]; then
-    log WARN "Interface eno1 não encontrada; abortando baseline de rede"
-    return 1
-  fi
-  cat > /etc/netplan/01-dogwatch.yaml <<EOF
+
+  local ci_netplan ci_cloud iface gateway
+  ci_netplan="$(ls /etc/netplan/*cloud-init*.yaml 2>/dev/null | head -n1 || true)"
+  ci_cloud="$(ls /etc/cloud/cloud.cfg.d/* 2>/dev/null | head -n1 || true)"
+
+  if [[ -z "$ci_netplan" && -z "$ci_cloud" ]]; then
+    iface="$(ip -o link show up | awk -F': ' '$2 !~ /lo/ {print $2; exit}' 2>/dev/null || true)"
+    if [[ -z "$iface" ]]; then
+      log WARN "Nenhuma interface ativa encontrada; abortando baseline de rede"
+      return 1
+    fi
+    gateway="$(ip route | awk '/default/ {print $3; exit}')"
+    cat > /etc/netplan/01-dogwatch.yaml <<EOF
 network:
   version: 2
   renderer: networkd
   ethernets:
-    eno1:
+    $iface:
       dhcp4: no
       addresses: [192.168.15.150/24]
-      gateway4: 192.168.15.1
+      routes:
+        - to: 0.0.0.0/0
+          via: $gateway
 EOF
-  if [[ -t 1 ]]; then
-    netplan try --timeout 60 >/dev/null 2>&1 <<<"y" || netplan apply >/dev/null 2>&1 || true
+    if [[ -t 1 ]]; then
+      netplan try --timeout 60 || { netplan generate && netplan apply; }
+    else
+      netplan generate && netplan apply
+    fi
   else
-    netplan apply >/dev/null 2>&1 || true
+    log INFO "Provisionamento cloud-init detectado; usando configuração existente"
   fi
+
   ssh_set_dual_port_mode || return 1
   ssh_set_restricted_mode || return 1
   if command -v ufw >/dev/null 2>&1; then
-    ufw --force reset >/dev/null 2>&1 || true
-    ufw default deny incoming >/dev/null 2>&1 || true
-    ufw allow "${PRIMARY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
-    ufw limit "${PRIMARY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
-    ufw deny "${EMERGENCY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
-    ufw --force enable >/dev/null 2>&1 || true
+    LC_ALL=C LANG=C ufw --force reset >/dev/null 2>&1 || true
+    LC_ALL=C LANG=C ufw default deny incoming >/dev/null 2>&1 || true
+    LC_ALL=C LANG=C ufw allow "${PRIMARY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
+    LC_ALL=C LANG=C ufw limit "${PRIMARY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
+    LC_ALL=C LANG=C ufw deny "${EMERGENCY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
+    LC_ALL=C LANG=C ufw --force enable >/dev/null 2>&1 || true
   fi
   if [[ -d /etc/fail2ban ]]; then
     mkdir -p /etc/fail2ban/jail.d
@@ -1141,7 +1204,7 @@ EOF
               EXTRA_PORTS="$(echo "$EXTRA_PORTS" | tr ' ' '\n' | grep -v "^$p$" | xargs)"
               sed -i "s/^EXTRA_PORTS=.*/EXTRA_PORTS=\"$EXTRA_PORTS\"/" "$ENV_FILE"
               # UFW remove rule
-              ufw delete allow "$p/tcp" || true
+              LC_ALL=C LANG=C ufw delete allow "$p/tcp" || true
               echo "Porta $p removida de EXTRA_PORTS e bloqueada no UFW (se presente)."
             else
               echo "Porta não está em EXTRA_PORTS."
@@ -1149,7 +1212,7 @@ EOF
           c)
             ss -lntup || true
             echo
-            ufw status verbose || true
+            LC_ALL=C LANG=C ufw status verbose || true
             ;;
         esac
         read -rp "Enter para continuar..." _ ;;
@@ -1162,8 +1225,8 @@ EOF
         echo "c) Parar e desabilitar firewalld"
         read -rp "Opção: " fo
         case "$fo" in
-          a) ufw --force enable; ensure_ports_open; echo "UFW ativado." ;;
-          b) ufw --force disable; echo "UFW desativado." ;;
+          a) LC_ALL=C LANG=C ufw --force enable; ensure_ports_open; echo "UFW ativado." ;;
+          b) LC_ALL=C LANG=C ufw --force disable; echo "UFW desativado." ;;
           c) systemctl stop firewalld || true; systemctl disable firewalld || true; echo "firewalld desativado." ;;
         esac
         read -rp "Enter para continuar..." _ ;;
@@ -1175,10 +1238,10 @@ EOF
         echo "d) Listar regras numeradas"
         read -rp "Opção: " lo
         case "$lo" in
-          a) read -rp "IP/CIDR para permitir: " ip; ufw allow from "$ip" || true ;;
-          b) read -rp "IP/CIDR para negar: " ip; ufw deny from "$ip" || true ;;
-          c) ufw status numbered; read -rp "Número da regra para deletar: " n; yes | ufw delete "$n" || true ;;
-          d) ufw status numbered || true ;;
+          a) read -rp "IP/CIDR para permitir: " ip; LC_ALL=C LANG=C ufw allow from "$ip" || true ;;
+          b) read -rp "IP/CIDR para negar: " ip; LC_ALL=C LANG=C ufw deny from "$ip" || true ;;
+          c) LC_ALL=C LANG=C ufw status numbered; read -rp "Número da regra para deletar: " n; yes | LC_ALL=C LANG=C ufw delete "$n" || true ;;
+          d) LC_ALL=C LANG=C ufw status numbered || true ;;
         esac
         read -rp "Enter para continuar..." _ ;;
       9)
@@ -1187,7 +1250,7 @@ EOF
         echo "Ping/HTTP:"
         has_outbound_internet && echo "Internet de saída: OK" || echo "Internet de saída: FALHA"
         echo "Listening (ss):"; ss -lntup || true
-        echo "UFW:"; ufw status verbose || true
+        echo "UFW:"; LC_ALL=C LANG=C ufw status verbose || true
         echo "nft:"; nft list ruleset || true
         read -rp "Enter para continuar..." _ ;;
       10)
