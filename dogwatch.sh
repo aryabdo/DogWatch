@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.1.4"
+VERSION="1.2.0"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -91,8 +91,14 @@ load_env() {
   export LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
   export STATE_DIR="${STATE_DIR:-$STATE_DIR_DEFAULT}"
   export LOG_LEVEL="${LOG_LEVEL:-INFO}"
-  export MANDATORY_OPEN_PORTS="${MANDATORY_OPEN_PORTS:-"22"}"
-  export EXTRA_PORTS="${EXTRA_PORTS:-"16309"}"
+  export PRIMARY_SSH_PORT="${PRIMARY_SSH_PORT:-16309}"
+  export EMERGENCY_SSH_PORT="${EMERGENCY_SSH_PORT:-22}"
+  export RESTORE_EMERGENCY_PORTS="${RESTORE_EMERGENCY_PORTS:-16309}"
+  export EMERGENCY_WINDOW_ON_000="${EMERGENCY_WINDOW_ON_000:-1}"
+  export EMERGENCY_TTL_HOURS="${EMERGENCY_TTL_HOURS:-12}"
+  export REQUIRE_ICMP_AND_HTTP="${REQUIRE_ICMP_AND_HTTP:-1}"
+  export MANDATORY_OPEN_PORTS="${MANDATORY_OPEN_PORTS:-"$PRIMARY_SSH_PORT"}"
+  export EXTRA_PORTS="${EXTRA_PORTS:-""}"
   export PREFERRED_INTERFACES="${PREFERRED_INTERFACES:-""}"
   export PING_TARGETS="${PING_TARGETS:-"1.1.1.1 8.8.8.8"}"
   export HTTP_TARGETS="${HTTP_TARGETS:-"https://www.google.com https://cloudflare.com"}"
@@ -138,8 +144,14 @@ install_self() {
   else
     mkdir -p "$(dirname "$ENV_FILE")"
     cat > "$ENV_FILE" <<'EOF'
-MANDATORY_OPEN_PORTS="22"
-EXTRA_PORTS="16309"
+PRIMARY_SSH_PORT="16309"
+EMERGENCY_SSH_PORT="22"
+RESTORE_EMERGENCY_PORTS="16309"
+EMERGENCY_WINDOW_ON_000=1
+EMERGENCY_TTL_HOURS="12"
+REQUIRE_ICMP_AND_HTTP=1
+MANDATORY_OPEN_PORTS="16309"
+EXTRA_PORTS=""
 PREFERRED_INTERFACES=""
 PING_TARGETS="1.1.1.1 8.8.8.8"
 HTTP_TARGETS="https://www.google.com https://cloudflare.com"
@@ -345,6 +357,11 @@ restore_snapshot() {
   systemctl restart NetworkManager 2>/dev/null || true
   systemctl restart networking 2>/dev/null || true
   reset_remote_access
+  if [[ "$snap" == "000-initial" && "$EMERGENCY_WINDOW_ON_000" == "1" ]]; then
+    ensure_ports_open "$PRIMARY_SSH_PORT $RESTORE_EMERGENCY_PORTS $EMERGENCY_SSH_PORT"
+  else
+    ensure_ports_open "$RESTORE_EMERGENCY_PORTS"
+  fi
 
   log INFO "Reiniciando servidor..."
   sleep 20
@@ -409,7 +426,11 @@ has_outbound_internet() {
       fi
     done
   done
-  [[ $ping_ok -eq 0 && $http_ok -eq 0 ]]
+  if [[ "${REQUIRE_ICMP_AND_HTTP:-1}" == "1" ]]; then
+    [[ $ping_ok -eq 0 && $http_ok -eq 0 ]]
+  else
+    [[ $ping_ok -eq 0 || $http_ok -eq 0 ]]
+  fi
 }
 
 has_remote_access() {
@@ -530,7 +551,7 @@ firewall_allows_ports() {
 }
 
 ensure_ports_open() {
-  local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
+  local ports="${*:-${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}}"
   ports="$(echo $ports)" # normaliza espaços
   for fw in $FIREWALLS; do
     case "$fw" in
@@ -634,7 +655,133 @@ reset_remote_access() {
     esac
   done
   ensure_ports_open
-  systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  ssh_safe_reload || true
+}
+
+ssh_safe_reload() {
+  if sshd -t 2>/dev/null; then
+    systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  else
+    log WARN "sshd_config inválido; reload abortado"
+    return 1
+  fi
+}
+
+ssh_set_dual_port_mode() {
+  load_env
+  sed -i '/^Port/d' /etc/ssh/sshd_config 2>/dev/null || true
+  {
+    echo "Port $PRIMARY_SSH_PORT"
+    echo "Port $EMERGENCY_SSH_PORT"
+  } >> /etc/ssh/sshd_config
+  ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
+  ssh_safe_reload || return 1
+  sleep 2
+  if $NC_BIN -z 127.0.0.1 "$PRIMARY_SSH_PORT" >/dev/null 2>&1; then
+    sed -i '/^Port/d' /etc/ssh/sshd_config
+    echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
+    ssh_safe_reload || return 1
+    return 0
+  else
+    log ERROR "Falha ao validar porta $PRIMARY_SSH_PORT"
+    return 1
+  fi
+}
+
+ssh_set_permissive_mode() {
+  local reason="$1"
+  load_env
+  sed -i '/^PasswordAuthentication/d;/^PermitRootLogin/d;/^AllowUsers/d;/^Port/d' /etc/ssh/sshd_config 2>/dev/null || true
+  echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+  echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
+  echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
+  echo "Port $EMERGENCY_SSH_PORT" >> /etc/ssh/sshd_config
+  ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
+  ssh_safe_reload || true
+  echo "$(date +%s) $EMERGENCY_TTL_HOURS $reason" > "$STATE_DIR/ssh_permissive.mode"
+  log WARN "Modo SSH permissivo ativado ($reason)"
+}
+
+ssh_set_restricted_mode() {
+  load_env
+  sed -i '/^PasswordAuthentication/d;/^PermitRootLogin/d;/^AllowUsers/d;/^Port/d' /etc/ssh/sshd_config 2>/dev/null || true
+  echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config
+  echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+  echo "AllowUsers aasn" >> /etc/ssh/sshd_config
+  echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
+  ssh_safe_reload || true
+  ensure_ports_open "$PRIMARY_SSH_PORT"
+  for fw in $FIREWALLS; do
+    case "$fw" in
+      ufw)
+        command -v ufw >/dev/null 2>&1 && ufw delete allow "$EMERGENCY_SSH_PORT/tcp" >/dev/null 2>&1 || true ;;
+      firewalld)
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+          firewall-cmd --remove-port="$EMERGENCY_SSH_PORT/tcp" --permanent 2>/dev/null || true
+          firewall-cmd --reload 2>/dev/null || true
+        fi ;;
+      nftables)
+        command -v nft >/dev/null 2>&1 && nft delete rule inet filter input tcp dport "$EMERGENCY_SSH_PORT" accept 2>/dev/null || true ;;
+      iptables)
+        command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p tcp --dport "$EMERGENCY_SSH_PORT" -j ACCEPT 2>/dev/null || true ;;
+    esac
+  done
+  rm -f "$STATE_DIR/ssh_permissive.mode" || true
+  log INFO "Modo SSH restrito aplicado"
+}
+
+ssh_check_ttl_and_restrict_if_needed() {
+  load_env
+  local file="$STATE_DIR/ssh_permissive.mode"
+  [[ -f "$file" ]] || return 0
+  read -r start ttl reason < "$file"
+  local now
+  now="$(date +%s)"
+  local expire=$((start + ttl*3600))
+  if (( now >= expire )); then
+    log WARN "Janela permissiva expirada; aplicando modo restrito"
+    ssh_set_restricted_mode
+  fi
+}
+
+apply_server_baseline() {
+  load_env
+  log INFO "Aplicando baseline do servidor"
+  if [[ ! -e /sys/class/net/eno1 ]]; then
+    log WARN "Interface eno1 não encontrada; abortando baseline de rede"
+    return 1
+  fi
+  cat > /etc/netplan/01-dogwatch.yaml <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eno1:
+      dhcp4: no
+      addresses: [192.168.15.150/24]
+      gateway4: 192.168.15.1
+EOF
+  netplan try --timeout 60 >/dev/null 2>&1 <<<"y" || netplan apply >/dev/null 2>&1 || true
+  ssh_set_dual_port_mode || return 1
+  ssh_set_restricted_mode || return 1
+  if command -v ufw >/dev/null 2>&1; then
+    ufw --force reset >/dev/null 2>&1 || true
+    ufw default deny incoming >/dev/null 2>&1 || true
+    ufw allow "${PRIMARY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
+    ufw limit "${PRIMARY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
+    ufw deny "${EMERGENCY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
+    ufw --force enable >/dev/null 2>&1 || true
+  fi
+  if [[ -d /etc/fail2ban ]]; then
+    sed -i "s/^port=.*/port=${PRIMARY_SSH_PORT}/" /etc/fail2ban/jail.local 2>/dev/null || true
+    systemctl restart fail2ban >/dev/null 2>&1 || true
+  fi
+  if has_outbound_internet && has_remote_access; then
+    log INFO "Baseline aplicada com sucesso"
+  else
+    log WARN "Falha na conectividade após baseline"
+    attempt_restore_queue || true
+  fi
 }
 
 detect_external_vs_internal() {
@@ -670,8 +817,10 @@ detect_external_vs_internal() {
 status_report() {
   load_env
   local green='\033[32m' yellow='\033[33m' red='\033[31m' reset='\033[0m'
-  local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
-  ports="$(echo $ports)"
+  local listen_ports="${MANDATORY_OPEN_PORTS}"
+  listen_ports="$(echo $listen_ports)"
+  local fw_ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
+  fw_ports="$(echo $fw_ports)"
 
   if [[ -f "$STATE_DIR/pending.hash" ]]; then
     echo -e "${yellow}Configuração pendente: aguardando estabilização${reset}"
@@ -684,6 +833,20 @@ status_report() {
     next="$(sed -n "$((idx+1))p" "$STATE_DIR/restore_queue.txt" 2>/dev/null || echo "-" )"
     echo -e "${yellow}Fila de restauração ativa (índice $idx de $((total-1)))${reset}"
     echo -e "${yellow}Próximo snapshot no reboot: $next${reset}"
+  fi
+
+  if [[ -f "$STATE_DIR/ssh_permissive.mode" ]]; then
+    local start ttl reason now remain
+    read -r start ttl reason < "$STATE_DIR/ssh_permissive.mode"
+    now="$(date +%s)"
+    remain=$((start + ttl*3600 - now))
+    if (( remain > 0 )); then
+      local hrs=$((remain/3600))
+      local mins=$(((remain%3600)/60))
+      echo -e "${yellow}Janela permissiva ativa ($reason) - restante: ${hrs}h${mins}m${reset}"
+    else
+      echo -e "${red}Janela permissiva expirada${reset}"
+    fi
   fi
 
   if [[ "${STOP_SERVICE_ON_SUCCESS:-0}" == "1" ]]; then
@@ -703,13 +866,13 @@ status_report() {
   fi
 
   local missing_ports
-  if missing_ports=$(listening_on_ports $ports); then
-    echo -e "${green}Portas ouvindo: $ports${reset}"
+  if missing_ports=$(listening_on_ports $listen_ports); then
+    echo -e "${green}Portas ouvindo: $listen_ports${reset}"
   else
     echo -e "${red}Portas não estão ouvindo: $missing_ports - iniciar serviços ou ajustar firewall${reset}"
   fi
 
-  if firewall_allows_ports $ports; then
+  if firewall_allows_ports $fw_ports; then
     echo -e "${green}Firewall permite portas necessárias${reset}"
   else
     echo -e "${yellow}Firewall bloqueando portas - execute ensure-ports${reset}"
@@ -754,6 +917,12 @@ attempt_restore_queue() {
   fi
   snap="$(sed -n "$((idx+1))p" "$STATE_DIR/restore_queue.txt")"
   log INFO "Tentando restauração: $snap"
+  if [[ "$snap" == "000-initial" && "$EMERGENCY_WINDOW_ON_000" == "1" ]]; then
+    ssh_set_permissive_mode "000-initial" || true
+    ensure_ports_open "$PRIMARY_SSH_PORT $RESTORE_EMERGENCY_PORTS $EMERGENCY_SSH_PORT"
+  else
+    ensure_ports_open "$RESTORE_EMERGENCY_PORTS"
+  fi
   echo $((idx+1)) > "$STATE_DIR/restore_index"
   restore_snapshot "$snap"
 }
@@ -763,7 +932,8 @@ finalize_restore_queue() {
   if [[ -f "$STATE_DIR/restore_queue.txt" ]]; then
     if has_outbound_internet; then
       compute_current_hash > "$STATE_DIR/last_good.hash" || true
-      rm -f "$STATE_DIR/restore_queue.txt" "$STATE_DIR/restore_index" "$STATE_DIR/restore_queue.exhausted"
+      rm -f "$STATE_DIR/restore_queue.txt" "$STATE_DIR/restore_index"
+      touch "$STATE_DIR/restore_queue.exhausted"
       log INFO "Fila de restauração concluída com sucesso"
       if [[ "${STOP_SERVICE_ON_SUCCESS:-0}" == "1" ]]; then
         systemctl disable --now "$PROG.service" || true
@@ -781,9 +951,11 @@ daemon_loop() {
   first_run_bootstrap
   # Garante portas obrigatórias
   ensure_ports_open
+  ssh_check_ttl_and_restrict_if_needed
 
   local last_backup_ts=0
   while true; do
+    ssh_check_ttl_and_restrict_if_needed
     # Backups rotativos a cada 30 min
     local now
     now="$(date +%s)"
@@ -855,6 +1027,8 @@ menu() {
 11) Instalar/checar dependências
 12) Configurações (editar config.env)
 13) Remover solução (mantém backups)
+14) Aplicar baseline do servidor
+15) Fechar acesso emergencial (porta 22)
 0) Sair
 ============================================================
 EOF
@@ -963,6 +1137,10 @@ EOF
         ${EDITOR:-nano} "$ENV_FILE" ;;
       13)
         uninstall_self ;;
+      14)
+        apply_server_baseline; read -rp "Enter para continuar..." _ ;;
+      15)
+        ssh_set_restricted_mode; echo "Acesso emergencial fechado."; read -rp "Enter para continuar..." _ ;;
       0) exit 0 ;;
       *) echo "Opção inválida"; sleep 1 ;;
     esac
