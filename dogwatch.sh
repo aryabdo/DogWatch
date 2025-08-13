@@ -96,6 +96,7 @@ load_env() {
   export RESTORE_EMERGENCY_PORTS="${RESTORE_EMERGENCY_PORTS:-16309}"
   export EMERGENCY_WINDOW_ON_000="${EMERGENCY_WINDOW_ON_000:-1}"
   export REQUIRE_ICMP_AND_HTTP="${REQUIRE_ICMP_AND_HTTP:-1}"
+  export REQUIRE_PUBLIC_REMOTE="${REQUIRE_PUBLIC_REMOTE:-0}"
   export MANDATORY_OPEN_PORTS="${MANDATORY_OPEN_PORTS:-"$PRIMARY_SSH_PORT"}"
   export EXTRA_PORTS="${EXTRA_PORTS:-""}"
   export PREFERRED_INTERFACES="${PREFERRED_INTERFACES:-""}"
@@ -152,6 +153,7 @@ RESTORE_EMERGENCY_PORTS="16309"
 EMERGENCY_WINDOW_ON_000=1
 EMERGENCY_TTL_HOURS="12"
 REQUIRE_ICMP_AND_HTTP=1
+REQUIRE_PUBLIC_REMOTE=0
 MANDATORY_OPEN_PORTS="16309"
 EXTRA_PORTS=""
 PREFERRED_INTERFACES=""
@@ -433,30 +435,43 @@ has_remote_access() {
   # Alguns ambientes não permitem testar o próprio IP público (hairpin NAT).
   # Caso o teste remoto falhe, fazemos um fallback para IPs locais para evitar
   # falsos negativos.
-  local ip
+  local ip require_public ports candidates used_fallback=0
+  require_public="${REQUIRE_PUBLIC_REMOTE:-0}"
   ip="$($CURL_BIN -fsS "$PUBLIC_IP_SERVICE" 2>/dev/null | tr -d '\r\n' || echo)"
-  local ports="$MANDATORY_OPEN_PORTS"
+  ports="$MANDATORY_OPEN_PORTS"
   ports="$(echo $ports)"
-  local candidates=(127.0.0.1)
-  while IFS= read -r addr; do
-    [[ -n "$addr" ]] && candidates+=("$addr")
-  done < <(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  if [[ "$require_public" != "1" ]]; then
+    candidates=(127.0.0.1)
+    while IFS= read -r addr; do
+      [[ -n "$addr" ]] && candidates+=("$addr")
+    done < <(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  fi
   for p in $ports; do
     if [[ -n "$ip" ]] && $NC_BIN -w2 -z "$ip" "$p" >/dev/null 2>&1; then
       log DEBUG "Porta remota OK: $ip:$p"
       continue
     fi
+    if [[ "$require_public" == "1" ]]; then
+      log DEBUG "Porta remota falhou: $ip:$p"
+      return 1
+    fi
     for candidate in "${candidates[@]}"; do
       if $NC_BIN -w2 -z "$candidate" "$p" >/dev/null 2>&1; then
         log DEBUG "Porta local OK (fallback): $candidate:$p"
+        used_fallback=1
         continue 2
       fi
     done
     log DEBUG "Porta remota falhou: $ip:$p"
     return 1
   done
+  if (( used_fallback )); then
+    log WARN "Possível hairpin NAT – acesso externo pode estar bloqueado"
+    return 2
+  fi
   return 0
 }
+
 
 listening_on_ports() {
   local ports="$*"
@@ -812,10 +827,22 @@ detect_external_vs_internal() {
     # Tem internet: se portas não estão abertas/listening, firewall bloqueia ou acesso remoto falha => interno
     local ports="$MANDATORY_OPEN_PORTS"
     ports="$(echo $ports)"
-    if listening_on_ports $ports && firewall_allows_ports $ports && has_remote_access; then
-      # Tudo parece ok
-      echo "normal"
-      return 2
+    if listening_on_ports $ports && firewall_allows_ports $ports; then
+      has_remote_access
+      case $? in
+        0)
+          echo "normal"
+          return 2
+          ;;
+        2)
+          echo "degradado"
+          return 3
+          ;;
+        *)
+          echo "internal"
+          return 1
+          ;;
+      esac
     else
       echo "internal"
       return 1
@@ -833,6 +860,7 @@ detect_external_vs_internal() {
     fi
   fi
 }
+
 
 status_report() {
   load_env
@@ -882,7 +910,12 @@ status_report() {
   if has_remote_access; then
     echo -e "${green}Acesso remoto: OK${reset}"
   else
-    echo -e "${red}Acesso remoto: FALHA - possível IP/porta incorreta${reset}"
+    rc=$?
+    if [[ $rc -eq 2 ]]; then
+      echo -e "${yellow}Acesso remoto: DEGRADADO - fallback local${reset}"
+    else
+      echo -e "${red}Acesso remoto: FALHA - possível IP/porta incorreta${reset}"
+    fi
   fi
 
   local missing_ports
@@ -905,6 +938,9 @@ status_report() {
       ;;
     internal)
       echo -e "${red}Status geral: interno - verificar serviços/firewall ou restaurar backup${reset}"
+      ;;
+    degradado)
+      echo -e "${yellow}Status geral: degradado - possível hairpin NAT${reset}"
       ;;
     external)
       echo -e "${yellow}Status geral: external - possível falha de provedor/rota${reset}"
@@ -1010,6 +1046,12 @@ daemon_loop() {
       internal)
         echo 0 > "$STATE_DIR/normal_streak"
         log WARN "Problema de conectividade INTERNAMENTE detectado. Iniciando autorreparo..."
+        ensure_ports_open
+        attempt_restore_queue || true
+        ;;
+      degradado)
+        echo 0 > "$STATE_DIR/normal_streak"
+        log WARN "Acesso remoto degradado detectado. Iniciando autorreparo..."
         ensure_ports_open
         attempt_restore_queue || true
         ;;

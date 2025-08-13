@@ -55,9 +55,10 @@ Logs: `/var/log/dogwatch/dogwatch.log`
 
 ## Principais funcionalidades
 - **Backup 0.0 (imutável)** na primeira execução + **backups a cada 30 min**, mantendo **10** (além do 0.0).
-- **Monitoramento a cada 5 min**: `normal | external | internal`.
+- **Monitoramento a cada 5 min**: `normal | external | internal | degradado`.
   - **external** (falha do provedor/rota): **não altera** o sistema.
   - **internal** (mudança local): **restauração automática** do snapshot mais novo → mais antigo (inclui 0.0), validando conexão após cada passo.
+  - **degradado** (fallback para IP local; possível hairpin NAT): **restauração automática**.
 - **Verifica acesso remoto** ao IP público e reverte para backups caso falhe, mesmo com internet disponível.
 - **Garante portas**: `22` (obrigatória) e abre `16309` (opcional); detecta firewalls instalados e abre portas necessárias automaticamente.
 - **Fila de restauração persistente** testa snapshots do mais novo ao mais antigo a cada reboot e pode desativar o serviço automaticamente com `STOP_SERVICE_ON_SUCCESS=1` após sucesso.
