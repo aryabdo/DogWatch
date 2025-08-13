@@ -20,8 +20,7 @@ main() {
   local virt
   virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
   if [[ "$virt" != "none" ]]; then
-    echo "[dogwatch] Ambiente virtual detectado ($virt); instalação abortada."
-    exit 1
+    echo "[dogwatch] Aviso: ambiente virtual detectado ($virt); prosseguindo com a instalação..."
   fi
   apt-get update -y || true
   DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates || true
