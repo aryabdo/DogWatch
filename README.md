@@ -60,6 +60,7 @@ Logs: `/var/log/dogwatch/dogwatch.log`
   - **internal** (mudança local): **restauração automática** do snapshot mais novo → mais antigo (inclui 0.0), validando conexão após cada passo.
 - **Verifica acesso remoto** ao IP público e reverte para backups caso falhe, mesmo com internet disponível.
 - **Garante portas**: `22` (obrigatória) e abre `16309` (opcional); detecta firewalls instalados e abre portas necessárias automaticamente.
+- **Fila de restauração persistente** testa snapshots do mais novo ao mais antigo a cada reboot e pode desativar o serviço automaticamente com `STOP_SERVICE_ON_SUCCESS=1` após sucesso.
 - **Recuperação SSH**: habilita login por senha de qualquer IP, limpa blacklists e desbloqueia usuários para restabelecer acesso.
 - **Menu interativo**: execute `dogwatch.sh` sem argumentos para backups, restauração, portas, firewalls, listas (UFW), diagnósticos, speedtest, editar config, etc.
 
