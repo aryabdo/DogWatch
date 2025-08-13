@@ -95,7 +95,6 @@ load_env() {
   export EMERGENCY_SSH_PORT="${EMERGENCY_SSH_PORT:-22}"
   export RESTORE_EMERGENCY_PORTS="${RESTORE_EMERGENCY_PORTS:-16309}"
   export EMERGENCY_WINDOW_ON_000="${EMERGENCY_WINDOW_ON_000:-1}"
-  export EMERGENCY_TTL_HOURS="${EMERGENCY_TTL_HOURS:-12}"
   export REQUIRE_ICMP_AND_HTTP="${REQUIRE_ICMP_AND_HTTP:-1}"
   export MANDATORY_OPEN_PORTS="${MANDATORY_OPEN_PORTS:-"$PRIMARY_SSH_PORT"}"
   export EXTRA_PORTS="${EXTRA_PORTS:-""}"
@@ -119,6 +118,9 @@ load_env() {
   export STOP_SERVICE_ON_SUCCESS="${STOP_SERVICE_ON_SUCCESS:-0}"
 
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE" || true
+  EMERGENCY_TTL_HOURS="${EMERGENCY_TTL_HOURS:-12}"
+  EMERGENCY_TTL_HOURS="${EMERGENCY_TTL_HOURS//[^0-9]/}"
+  export EMERGENCY_TTL_HOURS
   detect_firewalls
 
   mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$LOG_DIR" "$STATE_DIR"
@@ -338,15 +340,8 @@ restore_snapshot() {
   # Desabilita firewalls antes de restaurar
   safe_disable_firewalls
 
-  # Restaura arquivos sem apagar itens que não estejam no backup
-  while IFS= read -r src; do
-    dest="/$(basename "$src")"
-    if [[ -d "$src" ]]; then
-      rsync -a "$src/" "$dest/" 2>/dev/null || true
-    else
-      rsync -a "$src" "$dest" 2>/dev/null || true
-    fi
-  done < <(find "$dir/files" -mindepth 1 -maxdepth 1)
+  # Restaura arquivos preservando paths completos
+  rsync -a "$dir/files"/ / 2>/dev/null || true
 
   # Reaplica configurações de rede para garantir conectividade
   if command -v netplan >/dev/null 2>&1; then
@@ -469,7 +464,7 @@ listening_on_ports() {
 
   if command -v ss >/dev/null 2>&1; then
     for p in $ports; do
-      if ss -lnt "sport = :$p" 2>/dev/null | grep -q "."; then
+      if ss -ltn 2>/dev/null | awk -v p=":$p" '$4 ~ p"$"' | grep -q "."; then
         log DEBUG "Listening on $p"
       else
         missing+=("$p")
@@ -502,7 +497,7 @@ firewall_allows_ports() {
       ufw)
         if command -v ufw >/dev/null 2>&1; then
           local status
-          status="$(ufw status | tr '[:upper:]' '[:lower:]')"
+          status="$(LC_ALL=C ufw status | tr '[:upper:]' '[:lower:]')"
           if ! echo "$status" | grep -q "inactive"; then
             for p in $ports; do
               if echo "$status" | grep -qE "\\b${p}/tcp\\b.*allow|\\b${p}\\b.*allow"; then
@@ -550,6 +545,13 @@ firewall_allows_ports() {
   return 0
 }
 
+init_nft_chain() {
+  command -v nft >/dev/null 2>&1 || return 0
+  nft list table inet dogwatch >/dev/null 2>&1 && return 0
+  nft add table inet dogwatch 2>/dev/null || true
+  nft add chain inet dogwatch input '{ type filter hook input priority 0 ; }' 2>/dev/null || true
+}
+
 ensure_ports_open() {
   local ports="${*:-${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}}"
   ports="$(echo $ports)" # normaliza espaços
@@ -573,8 +575,9 @@ ensure_ports_open() {
         ;;
       nftables)
         if command -v nft >/dev/null 2>&1; then
+          init_nft_chain
           for p in $ports; do
-            nft add rule inet filter input tcp dport "$p" accept 2>/dev/null || true
+            nft add rule inet dogwatch input tcp dport "$p" accept 2>/dev/null || true
           done
           nft list ruleset >/etc/nftables.conf 2>/dev/null || true
           systemctl restart nftables 2>/dev/null || true
@@ -659,7 +662,13 @@ reset_remote_access() {
 }
 
 ssh_safe_reload() {
-  if sshd -t 2>/dev/null; then
+  local sshd_bin
+  sshd_bin="$(command -v sshd 2>/dev/null)"
+  if [[ -z "$sshd_bin" ]]; then
+    log WARN "sshd não encontrado; reload abortado"
+    return 1
+  fi
+  if "$sshd_bin" -t 2>/dev/null; then
     systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
   else
     log WARN "sshd_config inválido; reload abortado"
@@ -669,21 +678,20 @@ ssh_safe_reload() {
 
 ssh_set_dual_port_mode() {
   load_env
-  sed -i '/^Port/d' /etc/ssh/sshd_config 2>/dev/null || true
-  {
-    echo "Port $PRIMARY_SSH_PORT"
-    echo "Port $EMERGENCY_SSH_PORT"
-  } >> /etc/ssh/sshd_config
+  grep -q "^Port $PRIMARY_SSH_PORT" /etc/ssh/sshd_config 2>/dev/null || echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
+  grep -q "^Port $EMERGENCY_SSH_PORT" /etc/ssh/sshd_config 2>/dev/null || echo "Port $EMERGENCY_SSH_PORT" >> /etc/ssh/sshd_config
   ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
   ssh_safe_reload || return 1
   sleep 2
-  if $NC_BIN -z 127.0.0.1 "$PRIMARY_SSH_PORT" >/dev/null 2>&1; then
+  if $NC_BIN -z 127.0.0.1 "$PRIMARY_SSH_PORT" >/dev/null 2>&1 && \
+     $NC_BIN -z 127.0.0.1 "$EMERGENCY_SSH_PORT" >/dev/null 2>&1; then
     sed -i '/^Port/d' /etc/ssh/sshd_config
     echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
+    echo "Port $EMERGENCY_SSH_PORT" >> /etc/ssh/sshd_config
     ssh_safe_reload || return 1
     return 0
   else
-    log ERROR "Falha ao validar porta $PRIMARY_SSH_PORT"
+    log ERROR "Falha ao validar portas $PRIMARY_SSH_PORT e/ou $EMERGENCY_SSH_PORT"
     return 1
   fi
 }
@@ -710,7 +718,6 @@ ssh_set_restricted_mode() {
   echo "AllowUsers aasn" >> /etc/ssh/sshd_config
   echo "Port $PRIMARY_SSH_PORT" >> /etc/ssh/sshd_config
   ssh_safe_reload || true
-  ensure_ports_open "$PRIMARY_SSH_PORT"
   for fw in $FIREWALLS; do
     case "$fw" in
       ufw)
@@ -721,11 +728,12 @@ ssh_set_restricted_mode() {
           firewall-cmd --reload 2>/dev/null || true
         fi ;;
       nftables)
-        command -v nft >/dev/null 2>&1 && nft delete rule inet filter input tcp dport "$EMERGENCY_SSH_PORT" accept 2>/dev/null || true ;;
+        command -v nft >/dev/null 2>&1 && nft flush chain inet dogwatch input 2>/dev/null || true ;;
       iptables)
         command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p tcp --dport "$EMERGENCY_SSH_PORT" -j ACCEPT 2>/dev/null || true ;;
     esac
   done
+  ensure_ports_open "$PRIMARY_SSH_PORT"
   rm -f "$STATE_DIR/ssh_permissive.mode" || true
   log INFO "Modo SSH restrito aplicado"
 }
@@ -761,7 +769,11 @@ network:
       addresses: [192.168.15.150/24]
       gateway4: 192.168.15.1
 EOF
-  netplan try --timeout 60 >/dev/null 2>&1 <<<"y" || netplan apply >/dev/null 2>&1 || true
+  if [[ -t 1 ]]; then
+    netplan try --timeout 60 >/dev/null 2>&1 <<<"y" || netplan apply >/dev/null 2>&1 || true
+  else
+    netplan apply >/dev/null 2>&1 || true
+  fi
   ssh_set_dual_port_mode || return 1
   ssh_set_restricted_mode || return 1
   if command -v ufw >/dev/null 2>&1; then
@@ -773,7 +785,15 @@ EOF
     ufw --force enable >/dev/null 2>&1 || true
   fi
   if [[ -d /etc/fail2ban ]]; then
-    sed -i "s/^port=.*/port=${PRIMARY_SSH_PORT}/" /etc/fail2ban/jail.local 2>/dev/null || true
+    mkdir -p /etc/fail2ban/jail.d
+    if command -v crudini >/dev/null 2>&1; then
+      crudini --set /etc/fail2ban/jail.d/dogwatch.local sshd port "${PRIMARY_SSH_PORT}" >/dev/null 2>&1 || true
+    else
+      cat > /etc/fail2ban/jail.d/dogwatch.local <<EOF
+[sshd]
+port=${PRIMARY_SSH_PORT}
+EOF
+    fi
     systemctl restart fail2ban >/dev/null 2>&1 || true
   fi
   if has_outbound_internet && has_remote_access; then
@@ -845,7 +865,7 @@ status_report() {
       local mins=$(((remain%3600)/60))
       echo -e "${yellow}Janela permissiva ativa ($reason) - restante: ${hrs}h${mins}m${reset}"
     else
-      echo -e "${red}Janela permissiva expirada${reset}"
+      ssh_set_restricted_mode
     fi
   fi
 
