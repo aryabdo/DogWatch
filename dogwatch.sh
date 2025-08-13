@@ -129,6 +129,63 @@ load_env() {
   chmod 700 "$DATA_DIR" "$BACKUP_DIR" "$STATE_DIR" || true
 }
 
+enforce_primary_ssh_port_early() {
+  load_env
+  say "Configurando SSH para porta ${PRIMARY_SSH_PORT} (e ${EMERGENCY_SSH_PORT})…"
+
+  # Garante include de drop-ins
+  ensure_sshd_include
+
+  # Drop-in controlado pelo DogWatch
+  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
+# Managed by dogwatch
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+Port ${PRIMARY_SSH_PORT}
+Port ${EMERGENCY_SSH_PORT}
+PasswordAuthentication yes
+PermitRootLogin yes
+EOF
+  chmod 0644 /etc/ssh/sshd_config.d/99-dogwatch.conf || true
+
+  # SELinux (RHEL-like): liberar porta não padrão do sshd, se presente
+  if command -v semanage >/dev/null 2>&1; then
+    semanage port -a -t ssh_port_t -p tcp "${PRIMARY_SSH_PORT}" 2>/dev/null || \
+    semanage port -m -t ssh_port_t -p tcp "${PRIMARY_SSH_PORT}" 2>/dev/null || true
+  fi
+
+  # Evita conflito com socket activation
+  if systemctl list-unit-files | grep -q '^ssh\.socket'; then
+    systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+  fi
+
+  systemctl daemon-reload || true
+  # Habilita/ativa o serviço de acordo com o nome da distro
+  if systemctl list-unit-files | grep -q '^ssh\.service'; then
+    systemctl enable --now ssh >/dev/null 2>&1 || true
+    systemctl restart ssh >/dev/null 2>&1 || true
+  fi
+  if systemctl list-unit-files | grep -q '^sshd\.service'; then
+    systemctl enable --now sshd >/dev/null 2>&1 || true
+    systemctl restart sshd >/dev/null 2>&1 || true
+  fi
+
+  ssh_safe_reload || true
+
+  # Espera a porta subir
+  for i in {1..10}; do
+    if ss_port_listens "$PRIMARY_SSH_PORT"; then
+      log INFO "sshd escutando em ${PRIMARY_SSH_PORT}"
+      return 0
+    fi
+    sleep 1
+  done
+
+  log ERROR "sshd NÃO está escutando em ${PRIMARY_SSH_PORT}; verifique 'journalctl -u ssh' / 'journalctl -u sshd'"
+  return 1
+}
+
 # ------------- Install/Uninstall -------------
 install_self() {
   require_root
@@ -160,11 +217,16 @@ install_self() {
   }
 
   DEBIAN_FRONTEND=noninteractive apt-get update -y || true
-  install_pkgs curl jq rsync netcat-openbsd iproute2 ufw nftables iptables || \
+  install_pkgs curl jq rsync netcat-openbsd iproute2 ufw nftables iptables openssh-server || \
     log WARN "Falha ao instalar pacotes base"
   if ! install_pkgs wireguard-tools rclone ddclient dnsutils lsof nmap speedtest-cli; then
     log WARN "Falha ao instalar pacotes extras"
   fi
+
+  # === PRIMEIRO: fixar porta SSH e abrir firewall ===
+  enforce_primary_ssh_port_early
+  ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
+  # ==================================================
 
   say "Instalando arquivos..."
   mkdir -p "$DATA_DIR"
@@ -202,21 +264,6 @@ STOP_SERVICE_ON_SUCCESS=0
 EOF
   fi
 
-  ensure_sshd_include
-  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
-Port $PRIMARY_SSH_PORT
-Port $EMERGENCY_SSH_PORT
-PasswordAuthentication yes
-PermitRootLogin yes
-EOF
-  ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
-  if sshd -t 2>/dev/null; then
-    systemctl restart ssh >/dev/null 2>&1 || true
-    $NC_BIN -z 127.0.0.1 "$PRIMARY_SSH_PORT" >/dev/null 2>&1 || \
-      log WARN "Porta SSH $PRIMARY_SSH_PORT não está ouvindo"
-  else
-    log WARN "sshd_config inválido; reinício abortado"
-  fi
   if [[ -d /etc/fail2ban ]]; then
     mkdir -p /etc/fail2ban/jail.d
     if command -v crudini >/dev/null 2>&1; then
@@ -532,8 +579,10 @@ has_remote_access() {
 
 ss_port_listens() {
   local p="$1"
-  ss -H -ltn sport = :"$p" 2>/dev/null | grep -q . && return 0
-  ss -H -ltn 2>/dev/null | awk -v p="$p" '{gsub(/[\[\]]/,"",$4); n=split($4,a,":"); if (a[n]==p) {found=1; exit}} END {exit !found}' && return 0
+  ss -H -ltn "( sport = :$p )" 2>/dev/null | grep -q . && return 0
+  # fallback robusto (IPv4/IPv6)
+  ss -ltnp 2>/dev/null | awk -v p="$p" '$1=="LISTEN"{gsub(/[\[\]]/,"",$4);
+    n=split($4,a,":"); if (a[n]==p){found=1; exit}} END{exit !found}' && return 0
   $NC_BIN -w2 -z 127.0.0.1 "$p" >/dev/null 2>&1 && return 0
   $NC_BIN -w2 -z ::1 "$p"       >/dev/null 2>&1 && return 0
   return 1
@@ -787,7 +836,8 @@ ssh_safe_reload() {
     return 1
   fi
   if "$sshd_bin" -t 2>/dev/null; then
-    systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || \
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
   else
     log WARN "sshd_config inválido; reload abortado"
     return 1
