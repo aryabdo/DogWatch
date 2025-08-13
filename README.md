@@ -3,7 +3,7 @@
 Ferramenta para **controle de conexão**, **backups** de configs críticas e **autorreparo** (foco em restabelecer acesso remoto/SSH).  
 Pronta para instalação direta via **GitHub** (`git clone`) ou via **one-liner** com `curl`.
 
-> **Requisitos**: Ubuntu 24.04+, privilégios de root e systemd habilitado.
+> **Requisitos**: Ubuntu 24.04+, privilégios de root, systemd habilitado e ambiente não virtualizado (sem VMs/containers).
 
 ---
 
@@ -65,7 +65,7 @@ Logs: `/var/log/dogwatch/dogwatch.log`
 - **Recuperação SSH**: habilita login por senha de qualquer IP, limpa blacklists e desbloqueia usuários para restabelecer acesso.
 - **Menu interativo**: execute `dogwatch.sh` sem argumentos para backups, restauração, portas, firewalls, listas (UFW), diagnósticos, speedtest, editar config, etc.
 
-> **Atenção**: Atua assertivamente em componentes de rede/segurança. Tenha console físico/virtual para contingência.
+> **Atenção**: Atua assertivamente em componentes de rede/segurança. Tenha console físico/virtual para contingência. Não execute em ambientes virtualizados.
 
 ## Licença
 MIT (ajuste conforme sua política interna).
