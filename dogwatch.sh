@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.1.3"
+VERSION="1.1.4"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -53,8 +53,8 @@ load_env() {
   export LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
   export STATE_DIR="${STATE_DIR:-$STATE_DIR_DEFAULT}"
   export LOG_LEVEL="${LOG_LEVEL:-INFO}"
-  export MANDATORY_OPEN_PORTS="${MANDATORY_OPEN_PORTS:-"22 16309"}"
-  export EXTRA_PORTS="${EXTRA_PORTS:-""}"
+  export MANDATORY_OPEN_PORTS="${MANDATORY_OPEN_PORTS:-"22"}"
+  export EXTRA_PORTS="${EXTRA_PORTS:-"16309"}"
   export PREFERRED_INTERFACES="${PREFERRED_INTERFACES:-""}"
   export PING_TARGETS="${PING_TARGETS:-"1.1.1.1 8.8.8.8"}"
   export HTTP_TARGETS="${HTTP_TARGETS:-"https://www.google.com https://cloudflare.com"}"
@@ -97,8 +97,8 @@ install_self() {
   else
     mkdir -p "$(dirname "$ENV_FILE")"
     cat > "$ENV_FILE" <<'EOF'
-MANDATORY_OPEN_PORTS="22 16309"
-EXTRA_PORTS=""
+MANDATORY_OPEN_PORTS="22"
+EXTRA_PORTS="16309"
 PREFERRED_INTERFACES=""
 PING_TARGETS="1.1.1.1 8.8.8.8"
 HTTP_TARGETS="https://www.google.com https://cloudflare.com"
@@ -305,6 +305,7 @@ restore_snapshot() {
   reset_remote_access
 
   log INFO "Reiniciando servidor..."
+  sleep 20
   sudo reboot || reboot
 }
 
@@ -355,7 +356,7 @@ has_remote_access() {
   # falsos negativos.
   local ip
   ip="$($CURL_BIN -fsS "$PUBLIC_IP_SERVICE" 2>/dev/null | tr -d '\r\n' || echo)"
-  local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
+  local ports="$MANDATORY_OPEN_PORTS"
   ports="$(echo $ports)"
   local candidates=(127.0.0.1)
   while IFS= read -r addr; do
@@ -579,7 +580,7 @@ detect_external_vs_internal() {
   # Se hash mudou OU firewall/sshd listening problem OU acesso remoto falhou => interno
   if has_outbound_internet; then
     # Tem internet: se portas não estão abertas/listening, firewall bloqueia ou acesso remoto falha => interno
-    local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
+    local ports="$MANDATORY_OPEN_PORTS"
     ports="$(echo $ports)"
     if listening_on_ports $ports && firewall_allows_ports $ports && has_remote_access; then
       # Tudo parece ok
@@ -657,7 +658,7 @@ attempt_restore_chain() {
   for s in "${snaps[@]}"; do [[ "$s" != "000-initial" ]] && snaps_sorted+=("$s"); done
   snaps_sorted+=("000-initial")
 
-  local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
+  local ports="$MANDATORY_OPEN_PORTS"
   ports="$(echo $ports)"
   for s in "${snaps_sorted[@]}"; do
     [[ -z "$s" ]] && continue
