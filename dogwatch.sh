@@ -284,8 +284,15 @@ restore_snapshot() {
   # Desabilita firewalls antes de restaurar
   safe_disable_firewalls
 
-  # Restaura arquivos, removendo modificações não rastreadas
-  rsync -a --delete "$dir/files/" / 2>/dev/null || true
+  # Restaura arquivos, removendo modificações não rastreadas de forma segura
+  while IFS= read -r src; do
+    dest="/$(basename "$src")"
+    if [[ -d "$src" ]]; then
+      rsync -a --delete "$src/" "$dest/" 2>/dev/null || true
+    else
+      rsync -a "$src" "$dest" 2>/dev/null || true
+    fi
+  done < <(find "$dir/files" -mindepth 1 -maxdepth 1)
 
   # Reaplica configurações de rede para garantir conectividade
   if command -v netplan >/dev/null 2>&1; then
