@@ -110,6 +110,7 @@ load_env() {
   export PUBLIC_IP_SERVICE="${PUBLIC_IP_SERVICE:-https://ifconfig.me}"
   export PENDING_STABLE_CYCLES="${PENDING_STABLE_CYCLES:-2}"
   export STRICT_PENDING_CONNECTIVITY="${STRICT_PENDING_CONNECTIVITY:-1}"
+  export STOP_SERVICE_ON_SUCCESS="${STOP_SERVICE_ON_SUCCESS:-0}"
 
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE" || true
   detect_firewalls
@@ -153,6 +154,7 @@ BACKUP_INTERVAL_SECONDS=1800
 MAX_ROTATING_BACKUPS=10
 FIREWALLS="ufw firewalld nftables iptables"
 AGGRESSIVE_REPAIR=1
+STOP_SERVICE_ON_SUCCESS=0
 EOF
   fi
 
@@ -383,19 +385,31 @@ connectivity_healthy() {
 
 # ------------- Connectivity Checks -------------
 has_outbound_internet() {
-  # Testa ping ICMP e HTTP
+  # Testa ping ICMP e HTTP com múltiplos alvos e retries
+  local ping_ok=1 http_ok=1
   for ip in $PING_TARGETS; do
-    ping -c1 -W1 "$ip" >/dev/null 2>&1 && { log DEBUG "Ping OK: $ip"; break; } || true
+    for _ in {1..3}; do
+      if ping -c1 -W1 "$ip" >/dev/null 2>&1; then
+        log DEBUG "Ping OK: $ip"
+        ping_ok=0
+        break 2
+      fi
+    done
   done
-  local ping_ok=$?
-  local http_ok=1
   for url in $HTTP_TARGETS; do
-    $CURL_BIN -m 3 -fsS "$url" >/dev/null 2>&1 && { log DEBUG "HTTP OK: $url"; http_ok=0; break; } || true
+    for _ in {1..3}; do
+      local output status body
+      output="$($CURL_BIN -m3 -sS "$url" -w 'HTTPSTATUS:%{http_code}' 2>/dev/null)"
+      status="${output##*HTTPSTATUS:}"
+      body="${output%HTTPSTATUS:*}"
+      if [[ -n "$body" && "$status" =~ ^[0-9]+$ && "$status" -lt 400 ]]; then
+        log DEBUG "HTTP OK: $url ($status)"
+        http_ok=0
+        break 2
+      fi
+    done
   done
-  if [[ $ping_ok -eq 0 || $http_ok -eq 0 ]]; then
-    return 0
-  fi
-  return 1
+  [[ $ping_ok -eq 0 && $http_ok -eq 0 ]]
 }
 
 has_remote_access() {
@@ -663,6 +677,19 @@ status_report() {
     echo -e "${yellow}Configuração pendente: aguardando estabilização${reset}"
   fi
 
+  if [[ -f "$STATE_DIR/restore_queue.txt" ]]; then
+    local idx total next
+    idx="$(cat "$STATE_DIR/restore_index" 2>/dev/null || echo 0)"
+    total="$(wc -l < "$STATE_DIR/restore_queue.txt" 2>/dev/null || echo 0)"
+    next="$(sed -n "$((idx+1))p" "$STATE_DIR/restore_queue.txt" 2>/dev/null || echo "-" )"
+    echo -e "${yellow}Fila de restauração ativa (índice $idx de $((total-1)))${reset}"
+    echo -e "${yellow}Próximo snapshot no reboot: $next${reset}"
+  fi
+
+  if [[ "${STOP_SERVICE_ON_SUCCESS:-0}" == "1" ]]; then
+    echo -e "${yellow}STOP_SERVICE_ON_SUCCESS habilitado${reset}"
+  fi
+
   if has_outbound_internet; then
     echo -e "${green}Internet de saída: OK${reset}"
   else
@@ -702,32 +729,47 @@ status_report() {
   esac
 }
 
-attempt_restore_chain() {
-  # Tenta restaurar do mais novo ao mais antigo; inclui 000-initial por último
+setup_restore_queue() {
   load_env
   mapfile -t snaps < <(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d -printf "%P\n" | sort -r)
-  # Garante que 000-initial fique por último
   snaps_sorted=()
   for s in "${snaps[@]}"; do [[ "$s" != "000-initial" ]] && snaps_sorted+=("$s"); done
   snaps_sorted+=("000-initial")
+  printf "%s\n" "${snaps_sorted[@]}" > "$STATE_DIR/restore_queue.txt"
+  echo 0 > "$STATE_DIR/restore_index"
+}
 
-  local ports="$MANDATORY_OPEN_PORTS"
-  ports="$(echo $ports)"
-  for s in "${snaps_sorted[@]}"; do
-    [[ -z "$s" ]] && continue
-    log INFO "Tentando restauração: $s"
-    restore_snapshot "$s" || true
-    sleep 5
-    # Revalida conectividade
-    if has_outbound_internet && listening_on_ports $ports && has_remote_access; then
-      log INFO "Conectividade restaurada com snapshot: $s"
-      # Atualiza last_good.hash
+attempt_restore_queue() {
+  load_env
+  [[ -f "$STATE_DIR/restore_queue.exhausted" ]] && { log WARN "Fila de restauração já esgotada."; return 1; }
+  [[ -f "$STATE_DIR/restore_queue.txt" ]] || setup_restore_queue
+  local idx total snap
+  idx="$(cat "$STATE_DIR/restore_index" 2>/dev/null || echo 0)"
+  total="$(wc -l < "$STATE_DIR/restore_queue.txt")"
+  if (( idx >= total )); then
+    log WARN "Fila de restauração esgotada."
+    rm -f "$STATE_DIR/restore_queue.txt" "$STATE_DIR/restore_index"
+    touch "$STATE_DIR/restore_queue.exhausted"
+    return 1
+  fi
+  snap="$(sed -n "$((idx+1))p" "$STATE_DIR/restore_queue.txt")"
+  log INFO "Tentando restauração: $snap"
+  echo $((idx+1)) > "$STATE_DIR/restore_index"
+  restore_snapshot "$snap"
+}
+
+finalize_restore_queue() {
+  load_env
+  if [[ -f "$STATE_DIR/restore_queue.txt" ]]; then
+    if has_outbound_internet; then
       compute_current_hash > "$STATE_DIR/last_good.hash" || true
-      return 0
+      rm -f "$STATE_DIR/restore_queue.txt" "$STATE_DIR/restore_index" "$STATE_DIR/restore_queue.exhausted"
+      log INFO "Fila de restauração concluída com sucesso"
+      if [[ "${STOP_SERVICE_ON_SUCCESS:-0}" == "1" ]]; then
+        systemctl disable --now "$PROG.service" || true
+      fi
     fi
-  done
-  log WARN "Nenhuma restauração resolveu a conectividade."
-  return 1
+  fi
 }
 
 # ------------- Daemon Loops -------------
@@ -767,6 +809,7 @@ daemon_loop() {
         if [[ "$current_hash" != "$last_hash" ]]; then
           set_pending_hash "$current_hash"
         fi
+        finalize_restore_queue || true
         ;;
       external)
         echo 0 > "$STATE_DIR/normal_streak"
@@ -776,7 +819,7 @@ daemon_loop() {
         echo 0 > "$STATE_DIR/normal_streak"
         log WARN "Problema de conectividade INTERNAMENTE detectado. Iniciando autorreparo..."
         ensure_ports_open
-        attempt_restore_chain || true
+        attempt_restore_queue || true
         ;;
       *)
         echo 0 > "$STATE_DIR/normal_streak"
