@@ -533,8 +533,10 @@ listening_on_ports() {
   local missing=()
 
   if command -v ss >/dev/null 2>&1; then
+    local listening
+    listening="$(ss -H -ltn 2>/dev/null || true)"
     for p in $ports; do
-      if ss -H -ltn "( sport = :$p )" 2>/dev/null | grep -q '.'; then
+      if echo "$listening" | awk -v p="$p" '{gsub(/[\[\]]/,"",$4); n=split($4,a,":"); if (a[n]==p) {found=1; exit}} END {exit !found}'; then
         log DEBUG "Listening on $p"
       else
         missing+=("$p")
@@ -617,13 +619,13 @@ init_nft_chain() {
   grep -q 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null || echo 'include "/etc/nftables.d/*.nft"' >> /etc/nftables.conf
   if ! nft list table inet dogwatch >/dev/null 2>&1; then
     nft add table inet dogwatch 2>/dev/null || true
-    nft add chain inet dogwatch input '{ type filter hook input priority 0 ; policy accept; }' 2>/dev/null || true
+    nft add chain inet dogwatch input '{ type filter hook input priority -5 ; policy accept; }' 2>/dev/null || true
   fi
   if [[ ! -f /etc/nftables.d/dogwatch.nft ]]; then
     cat > /etc/nftables.d/dogwatch.nft <<'EOF'
 table inet dogwatch {
   chain input {
-    type filter hook input priority 0; policy accept;
+    type filter hook input priority -5; policy accept;
   }
 }
 EOF
@@ -664,7 +666,7 @@ ensure_ports_open() {
           {
             echo "table inet dogwatch {"
             echo "  chain input {"
-            echo "    type filter hook input priority 0; policy accept;"
+            echo "    type filter hook input priority -5; policy accept;"
             printf "%b" "$rules"
             echo "  }"
             echo "}"
