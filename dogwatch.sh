@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -341,21 +341,27 @@ has_outbound_internet() {
 has_remote_access() {
   # Verifica se portas obrigatórias estão acessíveis via IP público.
   # Alguns ambientes não permitem testar o próprio IP público (hairpin NAT).
-  # Caso o teste remoto falhe, fazemos um fallback para 127.0.0.1 para evitar
+  # Caso o teste remoto falhe, fazemos um fallback para IPs locais para evitar
   # falsos negativos.
   local ip
-  ip="$($CURL_BIN -fsS "$PUBLIC_IP_SERVICE" 2>/dev/null || echo)"
+  ip="$($CURL_BIN -fsS "$PUBLIC_IP_SERVICE" 2>/dev/null | tr -d '\r\n' || echo)"
   local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
   ports="$(echo $ports)"
+  local candidates=(127.0.0.1)
+  while IFS= read -r addr; do
+    [[ -n "$addr" ]] && candidates+=("$addr")
+  done < <(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
   for p in $ports; do
     if [[ -n "$ip" ]] && $NC_BIN -w2 -z "$ip" "$p" >/dev/null 2>&1; then
       log DEBUG "Porta remota OK: $ip:$p"
       continue
     fi
-    if $NC_BIN -w2 -z 127.0.0.1 "$p" >/dev/null 2>&1; then
-      log DEBUG "Porta local OK (fallback): 127.0.0.1:$p"
-      continue
-    fi
+    for candidate in "${candidates[@]}"; do
+      if $NC_BIN -w2 -z "$candidate" "$p" >/dev/null 2>&1; then
+        log DEBUG "Porta local OK (fallback): $candidate:$p"
+        continue 2
+      fi
+    done
     log DEBUG "Porta remota falhou: $ip:$p"
     return 1
   done
