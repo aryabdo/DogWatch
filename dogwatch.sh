@@ -141,7 +141,12 @@ install_self() {
     local pkgs=("$@")
     local attempt=0
     while (( attempt < 2 )); do
-      if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}" >/dev/null; then
+      local args=(install -y --no-install-recommends)
+      if (( attempt == 1 )); then
+        args+=(--reinstall)
+        log DEBUG "Forçando reinstalação de pacotes: ${pkgs[*]}"
+      fi
+      if DEBIAN_FRONTEND=noninteractive apt-get "${args[@]}" "${pkgs[@]}" >/dev/null; then
         return 0
       fi
       attempt=$((attempt+1))
