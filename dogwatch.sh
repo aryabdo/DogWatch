@@ -29,7 +29,17 @@ get_boot_id() {
 
 set_pending_hash() {
   local hash="$1"
-  echo "$hash" > "$STATE_DIR/pending.hash"
+  local pending_file="$STATE_DIR/pending.hash"
+  if [[ -f "$pending_file" ]] && [[ "$(cat "$pending_file" 2>/dev/null)" == "$hash" ]]; then
+    return 0
+  fi
+  if [[ "${STRICT_PENDING_CONNECTIVITY:-1}" == "1" ]]; then
+    if ! connectivity_healthy; then
+      log WARN "Alteração detectada, mas conectividade não está saudável; pendência não criada (aguardando saúde)."
+      return 1
+    fi
+  fi
+  echo "$hash" > "$pending_file"
   get_boot_id > "$STATE_DIR/pending.boot_id" || true
   log INFO "Configuração alterada detectada; aguardando promoção."
 }
@@ -99,6 +109,7 @@ load_env() {
   export SYSCTL_BIN="${SYSCTL_BIN:-$(command -v sysctl || echo /usr/sbin/sysctl)}"
   export PUBLIC_IP_SERVICE="${PUBLIC_IP_SERVICE:-https://ifconfig.me}"
   export PENDING_STABLE_CYCLES="${PENDING_STABLE_CYCLES:-2}"
+  export STRICT_PENDING_CONNECTIVITY="${STRICT_PENDING_CONNECTIVITY:-1}"
 
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE" || true
   detect_firewalls
@@ -359,6 +370,15 @@ compute_current_hash() {
   } >> "$tmp" 2>/dev/null
   sha256sum "$tmp" | awk '{print $1}'
   rm -f "$tmp"
+}
+
+connectivity_healthy() {
+  local ports="$MANDATORY_OPEN_PORTS"
+  ports="$(echo $ports)"
+  has_outbound_internet || return 1
+  listening_on_ports $ports >/dev/null || return 1
+  has_remote_access || return 1
+  return 0
 }
 
 # ------------- Connectivity Checks -------------
