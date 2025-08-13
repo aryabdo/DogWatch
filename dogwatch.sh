@@ -136,6 +136,10 @@ install_self() {
   say "Instalando dependências..."
   local virt
   virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
+  if [[ "$virt" != "none" ]]; then
+    log ERROR "Ambiente virtual detectado ($virt); instalação abortada"
+    exit 1
+  fi
 
   install_pkgs() {
     local pkgs=("$@")
@@ -158,13 +162,8 @@ install_self() {
   DEBIAN_FRONTEND=noninteractive apt-get update -y || true
   install_pkgs curl jq rsync netcat-openbsd iproute2 ufw nftables iptables || \
     log WARN "Falha ao instalar pacotes base"
-
-  if [[ "$virt" == "none" ]]; then
-    if ! install_pkgs wireguard-tools rclone ddclient dnsutils lsof nmap speedtest-cli; then
-      log WARN "Falha ao instalar pacotes extras"
-    fi
-  else
-    log WARN "Ambiente virtual detectado ($virt); pacotes extras não instalados"
+  if ! install_pkgs wireguard-tools rclone ddclient dnsutils lsof nmap speedtest-cli; then
+    log WARN "Falha ao instalar pacotes extras"
   fi
 
   say "Instalando arquivos..."
@@ -1070,6 +1069,12 @@ finalize_restore_queue() {
 daemon_loop() {
   require_root
   load_env
+  local virt
+  virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
+  if [[ "$virt" != "none" ]]; then
+    log ERROR "Ambiente virtual detectado ($virt); execução abortada"
+    exit 1
+  fi
   say "Iniciando daemon $PROG v$VERSION"
   # Garante backup inicial
   first_run_bootstrap

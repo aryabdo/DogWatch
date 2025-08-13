@@ -17,6 +17,12 @@ require_root() {
 
 main() {
   require_root
+  local virt
+  virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
+  if [[ "$virt" != "none" ]]; then
+    echo "[dogwatch] Ambiente virtual detectado ($virt); instalação abortada."
+    exit 1
+  fi
   apt-get update -y || true
   DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates || true
 
