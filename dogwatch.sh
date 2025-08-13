@@ -580,15 +580,23 @@ firewall_allows_ports() {
           done
         fi
         ;;
-      nftables)
-        if command -v nft >/dev/null 2>&1; then
-          local rules
-          rules="$(nft list ruleset 2>/dev/null || true)"
-          for p in $ports; do
-            echo "$rules" | grep -qw "dport $p" || blocked+=("$p")
-          done
-        fi
-        ;;
+        nftables)
+          if command -v nft >/dev/null 2>&1; then
+            local rules policy has_input_hook
+            rules="$(nft list ruleset 2>/dev/null || true)"
+            has_input_hook=0
+            echo "$rules" | grep -q 'hook input' && has_input_hook=1
+            policy="$(echo "$rules" | awk '
+            $1=="chain" && $2=="input" {inchain=1}
+            inchain && $0 ~ /policy/ {print tolower($0); exit}
+          ')"
+            if [[ $has_input_hook -eq 1 ]] && echo "$policy" | grep -Eq 'policy[[:space:]]+(drop|reject)'; then
+              for p in $ports; do
+                echo "$rules" | grep -qwE "tcp[[:space:]]+dport[[:space:]]+$p[[:space:]].*(accept|counter accept)" || blocked+=("$p")
+              done
+            fi
+          fi
+          ;;
       iptables)
         if command -v iptables >/dev/null 2>&1; then
           local rules policy
@@ -796,6 +804,24 @@ EOF
   ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
   ssh_safe_reload || true
   sleep 1
+
+  if ss_port_listens "$PRIMARY_SSH_PORT" && ss_port_listens "$EMERGENCY_SSH_PORT"; then
+    return 0
+  fi
+
+  command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null \
+    | grep -E '^(port|addressfamily|listenaddress) ' \
+    | xargs -I{} log DEBUG "sshd -T: {}" || true
+
+  {
+    echo ""
+    echo "AddressFamily any"
+    echo "ListenAddress 0.0.0.0"
+    echo "ListenAddress ::"
+  } >> /etc/ssh/sshd_config.d/99-dogwatch.conf
+
+  ssh_safe_reload || true
+  sleep 1
   if ! ss_port_listens "$PRIMARY_SSH_PORT"; then
     systemctl restart ssh 2>/dev/null || true
     sleep 1
@@ -804,7 +830,10 @@ EOF
   if ss_port_listens "$PRIMARY_SSH_PORT" && ss_port_listens "$EMERGENCY_SSH_PORT"; then
     return 0
   fi
-  command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null | grep -E '^port ' | xargs -I{} log DEBUG "sshd -T: {}" || true
+
+  command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null \
+    | grep -E '^(port|addressfamily|listenaddress) ' \
+    | xargs -I{} log DEBUG "sshd -T: {}" || true
   log ERROR "Falha ao validar portas $PRIMARY_SSH_PORT e/ou $EMERGENCY_SSH_PORT"
   return 1
 }
