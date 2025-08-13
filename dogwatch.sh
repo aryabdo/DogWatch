@@ -591,11 +591,15 @@ firewall_allows_ports() {
         ;;
       iptables)
         if command -v iptables >/dev/null 2>&1; then
-          local rules
+          local rules policy
           rules="$(iptables -L INPUT -n 2>/dev/null || true)"
-          for p in $ports; do
-            echo "$rules" | grep -qw "dpt:$p" || blocked+=("$p")
-          done
+          policy="$(echo "$rules" | sed -n 's/^Chain INPUT (policy \([A-Z]*\)).*/\1/p')"
+          # Só exige regra explícita se a policy for DROP/REJECT
+          if [[ "$policy" == "DROP" || "$policy" == "REJECT" ]]; then
+            for p in $ports; do
+              echo "$rules" | grep -qw "dpt:$p" || blocked+=("$p")
+            done
+          fi
         fi
         ;;
     esac
@@ -626,6 +630,11 @@ table inet dogwatch {
 EOF
     nft -f /etc/nftables.conf >/dev/null 2>&1 || true
   fi
+  # garante serviço nftables e aplica ruleset
+  if systemctl list-unit-files 2>/dev/null | grep -q '^nftables\.service'; then
+    systemctl enable --now nftables >/dev/null 2>&1 || true
+  fi
+  nft -f /etc/nftables.conf >/dev/null 2>&1 || true
 }
 
 ensure_ports_open() {
@@ -704,8 +713,16 @@ safe_disable_firewalls() {
 }
 
 ensure_sshd_include() {
-  grep -q '^Include /etc/ssh/sshd_config.d/\*.conf' /etc/ssh/sshd_config 2>/dev/null || \
-    printf '\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> /etc/ssh/sshd_config
+  local file="/etc/ssh/sshd_config"
+  # remove duplicatas
+  sed -i '/^Include[[:space:]]\+\/etc\/ssh\/sshd_config\.d\/\*\.conf$/d' "$file"
+  if grep -q '^[[:space:]]*Match[[:space:]]' "$file"; then
+    local ln
+    ln="$(grep -n '^[[:space:]]*Match[[:space:]]' "$file" | head -n1 | cut -d: -f1)"
+    sed -i "${ln}i Include /etc/ssh/sshd_config.d/*.conf" "$file"
+  else
+    sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$file"
+  fi
 }
 
 reset_remote_access() {
