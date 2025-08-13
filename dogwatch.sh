@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -528,35 +528,29 @@ has_remote_access() {
 }
 
 
+ss_port_listens() {
+  local p="$1"
+  ss -H -ltn sport = :"$p" 2>/dev/null | grep -q . && return 0
+  ss -H -ltn 2>/dev/null | awk -v p="$p" '{gsub(/[\[\]]/,"",$4); n=split($4,a,":"); if (a[n]==p) {found=1; exit}} END {exit !found}' && return 0
+  $NC_BIN -w2 -z 127.0.0.1 "$p" >/dev/null 2>&1 && return 0
+  $NC_BIN -w2 -z ::1 "$p"       >/dev/null 2>&1 && return 0
+  return 1
+}
+
 listening_on_ports() {
   local ports="$*"
   local missing=()
-
-  if command -v ss >/dev/null 2>&1; then
-    local listening
-    listening="$(ss -H -ltn 2>/dev/null || true)"
-    for p in $ports; do
-      if echo "$listening" | awk -v p="$p" '{gsub(/[\[\]]/,"",$4); n=split($4,a,":"); if (a[n]==p) {found=1; exit}} END {exit !found}'; then
-        log DEBUG "Listening on $p"
-      else
-        missing+=("$p")
-      fi
-    done
-  else
-    for p in $ports; do
-      if $NC_BIN -z 127.0.0.1 "$p" >/dev/null 2>&1 || \
-         $NC_BIN -z ::1 "$p" >/dev/null 2>&1; then
-        log DEBUG "Listening on $p"
-      else
-        missing+=("$p")
-      fi
-    done
-  fi
-
-  if (( ${#missing[@]} > 0 )); then
+  for p in $ports; do
+    if ss_port_listens "$p"; then
+      log DEBUG "Listening on $p"
+    else
+      missing+=("$p")
+    fi
+  done
+  if (( ${#missing[@]} )); then
     log DEBUG "Não está ouvindo em: ${missing[*]}"
-    echo "${missing[*]}"
-    return 1
+    command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null | grep -E '^port ' | xargs -I{} log DEBUG "sshd -T: {}" || true
+    echo "${missing[*]}"; return 1
   fi
   return 0
 }
@@ -616,16 +610,17 @@ firewall_allows_ports() {
 init_nft_chain() {
   command -v nft >/dev/null 2>&1 || return 0
   mkdir -p /etc/nftables.d
-  grep -q 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null || echo 'include "/etc/nftables.d/*.nft"' >> /etc/nftables.conf
+  grep -q 'include "/etc/nftables.d/*.nft"' /etc/nftables.conf 2>/dev/null || \
+    echo 'include "/etc/nftables.d/*.nft"' >> /etc/nftables.conf
   if ! nft list table inet dogwatch >/dev/null 2>&1; then
     nft add table inet dogwatch 2>/dev/null || true
-    nft add chain inet dogwatch input '{ type filter hook input priority -5 ; policy accept; }' 2>/dev/null || true
+    nft add chain inet dogwatch input '{ type filter hook input priority -200 ; policy accept; }' 2>/dev/null || true
   fi
   if [[ ! -f /etc/nftables.d/dogwatch.nft ]]; then
     cat > /etc/nftables.d/dogwatch.nft <<'EOF'
 table inet dogwatch {
   chain input {
-    type filter hook input priority -5; policy accept;
+    type filter hook input priority -200; policy accept;
   }
 }
 EOF
@@ -666,7 +661,7 @@ ensure_ports_open() {
           {
             echo "table inet dogwatch {"
             echo "  chain input {"
-            echo "    type filter hook input priority -5; policy accept;"
+            echo "    type filter hook input priority -200; policy accept;"
             printf "%b" "$rules"
             echo "  }"
             echo "}"
@@ -777,17 +772,24 @@ ssh_set_dual_port_mode() {
   cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
 Port $PRIMARY_SSH_PORT
 Port $EMERGENCY_SSH_PORT
+PasswordAuthentication yes
+PermitRootLogin yes
 EOF
+
   ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
-  ssh_safe_reload || return 1
-  sleep 2
-  if $NC_BIN -z 127.0.0.1 "$PRIMARY_SSH_PORT" >/dev/null 2>&1 && \
-     $NC_BIN -z 127.0.0.1 "$EMERGENCY_SSH_PORT" >/dev/null 2>&1; then
-    return 0
-  else
-    log ERROR "Falha ao validar portas $PRIMARY_SSH_PORT e/ou $EMERGENCY_SSH_PORT"
-    return 1
+  ssh_safe_reload || true
+  sleep 1
+  if ! ss_port_listens "$PRIMARY_SSH_PORT"; then
+    systemctl restart ssh 2>/dev/null || true
+    sleep 1
   fi
+
+  if ss_port_listens "$PRIMARY_SSH_PORT" && ss_port_listens "$EMERGENCY_SSH_PORT"; then
+    return 0
+  fi
+  command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null | grep -E '^port ' | xargs -I{} log DEBUG "sshd -T: {}" || true
+  log ERROR "Falha ao validar portas $PRIMARY_SSH_PORT e/ou $EMERGENCY_SSH_PORT"
+  return 1
 }
 
 ssh_set_permissive_mode() {
