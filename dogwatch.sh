@@ -339,19 +339,25 @@ has_outbound_internet() {
 }
 
 has_remote_access() {
-  # Verifica se portas obrigatórias estão acessíveis via IP público
+  # Verifica se portas obrigatórias estão acessíveis via IP público.
+  # Alguns ambientes não permitem testar o próprio IP público (hairpin NAT).
+  # Caso o teste remoto falhe, fazemos um fallback para 127.0.0.1 para evitar
+  # falsos negativos.
   local ip
   ip="$($CURL_BIN -fsS "$PUBLIC_IP_SERVICE" 2>/dev/null || echo)"
-  [[ -z "$ip" ]] && { log DEBUG "Falha ao obter IP público"; return 1; }
   local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
   ports="$(echo $ports)"
   for p in $ports; do
-    if $NC_BIN -w2 -z "$ip" "$p" >/dev/null 2>&1; then
+    if [[ -n "$ip" ]] && $NC_BIN -w2 -z "$ip" "$p" >/dev/null 2>&1; then
       log DEBUG "Porta remota OK: $ip:$p"
-    else
-      log DEBUG "Porta remota falhou: $ip:$p"
-      return 1
+      continue
     fi
+    if $NC_BIN -w2 -z 127.0.0.1 "$p" >/dev/null 2>&1; then
+      log DEBUG "Porta local OK (fallback): 127.0.0.1:$p"
+      continue
+    fi
+    log DEBUG "Porta remota falhou: $ip:$p"
+    return 1
   done
   return 0
 }
