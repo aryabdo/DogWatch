@@ -284,11 +284,11 @@ restore_snapshot() {
   # Desabilita firewalls antes de restaurar
   safe_disable_firewalls
 
-  # Restaura arquivos, removendo modificações não rastreadas de forma segura
+  # Restaura arquivos sem apagar itens que não estejam no backup
   while IFS= read -r src; do
     dest="/$(basename "$src")"
     if [[ -d "$src" ]]; then
-      rsync -a --delete "$src/" "$dest/" 2>/dev/null || true
+      rsync -a "$src/" "$dest/" 2>/dev/null || true
     else
       rsync -a "$src" "$dest" 2>/dev/null || true
     fi
@@ -303,6 +303,9 @@ restore_snapshot() {
   systemctl restart NetworkManager 2>/dev/null || true
   systemctl restart networking 2>/dev/null || true
   reset_remote_access
+
+  log INFO "Reiniciando servidor..."
+  sudo reboot || reboot
 }
 
 compute_current_hash() {
