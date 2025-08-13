@@ -201,15 +201,43 @@ STOP_SERVICE_ON_SUCCESS=0
 EOF
   fi
 
+  ensure_sshd_include
+  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
+Port $PRIMARY_SSH_PORT
+Port $EMERGENCY_SSH_PORT
+PasswordAuthentication yes
+PermitRootLogin yes
+EOF
+  ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
+  if sshd -t 2>/dev/null; then
+    systemctl restart ssh >/dev/null 2>&1 || true
+    $NC_BIN -z 127.0.0.1 "$PRIMARY_SSH_PORT" >/dev/null 2>&1 || \
+      log WARN "Porta SSH $PRIMARY_SSH_PORT não está ouvindo"
+  else
+    log WARN "sshd_config inválido; reinício abortado"
+  fi
+  if [[ -d /etc/fail2ban ]]; then
+    mkdir -p /etc/fail2ban/jail.d
+    if command -v crudini >/dev/null 2>&1; then
+      crudini --set /etc/fail2ban/jail.d/dogwatch.local sshd port "$PRIMARY_SSH_PORT" >/dev/null 2>&1 || true
+    else
+      cat > /etc/fail2ban/jail.d/dogwatch.local <<EOF
+[sshd]
+port=${PRIMARY_SSH_PORT}
+EOF
+    fi
+    systemctl restart fail2ban >/dev/null 2>&1 || true
+  fi
+
   install -m 0644 "./$PROG.service" "/etc/systemd/system/$PROG.service"
   systemctl daemon-reload
-  systemctl enable "$PROG.service" || true
+  systemctl enable --now "$PROG.service" || true
 
   say "Criando backup inicial 0.0..."
   first_run_bootstrap
 
   say "Instalação concluída."
-  say "Inicie com: systemctl start $PROG.service"
+  say "Serviço iniciado." 
 }
 
 uninstall_self() {
@@ -506,7 +534,7 @@ listening_on_ports() {
 
   if command -v ss >/dev/null 2>&1; then
     for p in $ports; do
-      if ss -ltn 2>/dev/null | awk -v p=":$p" '$4 ~ p"$"' | grep -q "."; then
+      if ss -H -ltn "( sport = :$p )" 2>/dev/null | grep -q '.'; then
         log DEBUG "Listening on $p"
       else
         missing+=("$p")
@@ -539,10 +567,10 @@ firewall_allows_ports() {
       ufw)
         if command -v ufw >/dev/null 2>&1; then
           local status
-          status="$(LC_ALL=C LANG=C ufw status numbered 2>/dev/null || true)"
+          status="$(LC_ALL=C LANG=C ufw status 2>/dev/null || true)"
           if echo "$status" | grep -q '^Status: active'; then
             for p in $ports; do
-              echo "$status" | awk -v port="${p}/tcp" '$2==port && $3=="ALLOW" {found=1} END {exit !found}' || blocked+=("$p")
+              echo "$status" | awk -v port="${p}/tcp" '($1==port || $1==port" (v6)") && $2 ~ /^ALLOW/ {found=1} END {exit !found}' || blocked+=("$p")
             done
           fi
         fi
@@ -1078,8 +1106,9 @@ daemon_loop() {
   say "Iniciando daemon $PROG v$VERSION"
   # Garante backup inicial
   first_run_bootstrap
-  # Garante portas obrigatórias
+  # Valida portas e configuração do SSH antes do monitoramento
   ensure_ports_open
+  ssh_set_dual_port_mode || true
   ssh_check_ttl_and_restrict_if_needed
 
   local last_backup_ts=0

@@ -1,16 +1,15 @@
 [Unit]
 Description=DogWatch daemon
-After=network.target
+Wants=network-online.target
+After=network-online.target
 StartLimitIntervalSec=0
 StartLimitBurst=0
-
-Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/opt/dogwatch/dogwatch.sh daemon
 Restart=always
-RestartSec=1
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
