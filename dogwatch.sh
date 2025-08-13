@@ -137,8 +137,7 @@ install_self() {
   local virt
   virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
   if [[ "$virt" != "none" ]]; then
-    log ERROR "Ambiente virtual detectado ($virt); instalação abortada"
-    exit 1
+    log WARN "Ambiente virtual detectado ($virt); prosseguindo mesmo assim"
   fi
 
   install_pkgs() {
@@ -168,7 +167,8 @@ install_self() {
 
   say "Instalando arquivos..."
   mkdir -p "$DATA_DIR"
-  install -m 0755 "$(realpath "$0")" "$DATA_DIR/$PROG.sh"
+  install -m 0755 "$(readlink -f "${BASH_SOURCE[0]}")" "$DATA_DIR/$PROG.sh"
+  log INFO "Instalado $PROG v$VERSION em $DATA_DIR/$PROG.sh"
   if [[ -f ./config.env.example ]]; then
     install -m 0644 ./config.env.example "$ENV_FILE"
   else
@@ -580,23 +580,20 @@ firewall_allows_ports() {
           done
         fi
         ;;
-        nftables)
-          if command -v nft >/dev/null 2>&1; then
-            local rules policy has_input_hook
-            rules="$(nft list ruleset 2>/dev/null || true)"
-            has_input_hook=0
-            echo "$rules" | grep -q 'hook input' && has_input_hook=1
-            policy="$(echo "$rules" | awk '
-            $1=="chain" && $2=="input" {inchain=1}
-            inchain && $0 ~ /policy/ {print tolower($0); exit}
-          ')"
-            if [[ $has_input_hook -eq 1 ]] && echo "$policy" | grep -Eq 'policy[[:space:]]+(drop|reject)'; then
-              for p in $ports; do
-                echo "$rules" | grep -qwE "tcp[[:space:]]+dport[[:space:]]+$p[[:space:]].*(accept|counter accept)" || blocked+=("$p")
-              done
-            fi
+      nftables)
+        if command -v nft >/dev/null 2>&1; then
+          local rules policy has_input_hook
+          rules="$(nft list ruleset 2>/dev/null || true)"
+          has_input_hook=0; echo "$rules" | grep -q 'hook input' && has_input_hook=1
+          policy="$(echo "$rules" | awk '$1=="chain" && $2=="input"{in=1} in&&/policy/{print tolower($0); exit}')"
+          # só exigir regra explícita se a chain input tiver hook e policy drop/reject
+          if [[ $has_input_hook -eq 1 ]] && echo "$policy" | grep -Eq 'policy[[:space:]]+(drop|reject)'; then
+            for p in $ports; do
+              echo "$rules" | grep -qwE "tcp[[:space:]]+dport[[:space:]]+$p[[:space:]].*(accept|counter accept)" || blocked+=("$p")
+            done
           fi
-          ;;
+        fi
+        ;;
       iptables)
         if command -v iptables >/dev/null 2>&1; then
           local rules policy
@@ -721,16 +718,17 @@ safe_disable_firewalls() {
 }
 
 ensure_sshd_include() {
-  local file="/etc/ssh/sshd_config"
+  local main="/etc/ssh/sshd_config" incdir="/etc/ssh/sshd_config.d"
+  install -d -m 0755 "$incdir"
   # remove duplicatas
-  sed -i '/^Include[[:space:]]\+\/etc\/ssh\/sshd_config\.d\/\*\.conf$/d' "$file"
-  if grep -q '^[[:space:]]*Match[[:space:]]' "$file"; then
-    local ln
-    ln="$(grep -n '^[[:space:]]*Match[[:space:]]' "$file" | head -n1 | cut -d: -f1)"
-    sed -i "${ln}i Include /etc/ssh/sshd_config.d/*.conf" "$file"
+  sed -i '/^[[:space:]]*Include[[:space:]]\+\/etc\/ssh\/sshd_config\.d\/\*\.conf[[:space:]]*$/d' "$main"
+  if grep -q '^[[:space:]]*Match[[:space:]]' "$main"; then
+    local ln; ln="$(grep -n '^[[:space:]]*Match[[:space:]]' "$main" | head -n1 | cut -d: -f1)"
+    sed -i "${ln}i Include /etc/ssh/sshd_config.d/*.conf" "$main"
   else
-    sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$file"
+    sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$main"
   fi
+  chmod 0600 "$main" 2>/dev/null || true
 }
 
 reset_remote_access() {
@@ -794,14 +792,21 @@ ssh_safe_reload() {
 ssh_set_dual_port_mode() {
   load_env
   ensure_sshd_include
-  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
+  install -m 0644 /dev/stdin /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
 Port $PRIMARY_SSH_PORT
 Port $EMERGENCY_SSH_PORT
 PasswordAuthentication yes
 PermitRootLogin yes
 EOF
 
-  ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
+  ssh_safe_reload || true
+  sleep 1
+  if ss_port_listens "$PRIMARY_SSH_PORT" && ss_port_listens "$EMERGENCY_SSH_PORT"; then
+    return 0
+  fi
+
+  # Força AF e bind amplo se ainda não abriu
+  sed -i '$a AddressFamily any\nListenAddress 0.0.0.0\nListenAddress ::' /etc/ssh/sshd_config.d/99-dogwatch.conf
   ssh_safe_reload || true
   sleep 1
 
@@ -810,31 +815,9 @@ EOF
   fi
 
   command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null \
-    | grep -E '^(port|addressfamily|listenaddress) ' \
+    | grep -E '^(port|listenaddress|addressfamily) ' \
     | xargs -I{} log DEBUG "sshd -T: {}" || true
-
-  {
-    echo ""
-    echo "AddressFamily any"
-    echo "ListenAddress 0.0.0.0"
-    echo "ListenAddress ::"
-  } >> /etc/ssh/sshd_config.d/99-dogwatch.conf
-
-  ssh_safe_reload || true
-  sleep 1
-  if ! ss_port_listens "$PRIMARY_SSH_PORT"; then
-    systemctl restart ssh 2>/dev/null || true
-    sleep 1
-  fi
-
-  if ss_port_listens "$PRIMARY_SSH_PORT" && ss_port_listens "$EMERGENCY_SSH_PORT"; then
-    return 0
-  fi
-
-  command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null \
-    | grep -E '^(port|addressfamily|listenaddress) ' \
-    | xargs -I{} log DEBUG "sshd -T: {}" || true
-  log ERROR "Falha ao validar portas $PRIMARY_SSH_PORT e/ou $EMERGENCY_SSH_PORT"
+  log ERROR "Ainda não escuta em $PRIMARY_SSH_PORT e/ou $EMERGENCY_SSH_PORT"
   return 1
 }
 
@@ -1008,6 +991,10 @@ detect_external_vs_internal() {
 
 
 status_report() {
+  if ! systemctl is-active --quiet "$PROG.service" 2>/dev/null; then
+    local yellow='\033[33m' reset='\033[0m'
+    echo -e "${yellow}Atenção: daemon $PROG não está ativo — restauração automática NÃO ocorrerá.${reset}"
+  fi
   load_env
   local green='\033[32m' yellow='\033[33m' red='\033[31m' reset='\033[0m'
   local listen_ports="${MANDATORY_OPEN_PORTS}"
@@ -1150,15 +1137,18 @@ daemon_loop() {
   local virt
   virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
   if [[ "$virt" != "none" ]]; then
-    log ERROR "Ambiente virtual detectado ($virt); execução abortada"
-    exit 1
+    log WARN "Ambiente virtual detectado ($virt); prosseguindo mesmo assim"
   fi
   say "Iniciando daemon $PROG v$VERSION"
+  log INFO "DogWatch versão $VERSION (bin: $(readlink -f "$0"))"
   # Garante backup inicial
   first_run_bootstrap
   # Valida portas e configuração do SSH antes do monitoramento
   ensure_ports_open
-  ssh_set_dual_port_mode || true
+  if ! ssh_set_dual_port_mode; then
+    log WARN "SSHD não validado; tentando apenas abrir firewall"
+    ensure_ports_open
+  fi
   ssh_check_ttl_and_restrict_if_needed
 
   local last_backup_ts=0
@@ -1371,6 +1361,7 @@ case "${1:-}" in
   list-backups) list_backups ;;
   ensure-ports) ensure_ports_open ;;
   status) status_report ;;
+  repair-now) ensure_ports_open; detect_external_vs_internal >/dev/null || true; attempt_restore_queue || true ;;
   "") menu ;;
   *)
     cat <<EOF
