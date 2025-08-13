@@ -23,6 +23,34 @@ require_root() {
   fi
 }
 
+get_boot_id() {
+  cat /proc/sys/kernel/random/boot_id 2>/dev/null
+}
+
+set_pending_hash() {
+  local hash="$1"
+  echo "$hash" > "$STATE_DIR/pending.hash"
+  get_boot_id > "$STATE_DIR/pending.boot_id" || true
+  log INFO "Configuração alterada detectada; aguardando promoção."
+}
+
+promote_pending_if_stable() {
+  local pending_file="$STATE_DIR/pending.hash"
+  [[ -f "$pending_file" ]] || return 0
+  local streak
+  streak="$(cat "$STATE_DIR/normal_streak" 2>/dev/null || echo 0)"
+  if (( streak >= PENDING_STABLE_CYCLES )); then
+    local pending_boot current_boot
+    pending_boot="$(cat "$STATE_DIR/pending.boot_id" 2>/dev/null || echo)"
+    current_boot="$(get_boot_id)"
+    if [[ -f "$STATE_DIR/admin_ack" || "$current_boot" != "$pending_boot" ]]; then
+      cp "$pending_file" "$STATE_DIR/last_good.hash"
+      rm -f "$pending_file" "$STATE_DIR/pending.boot_id" "$STATE_DIR/admin_ack"
+      log INFO "Configuração pendente promovida para last_good.hash."
+    fi
+  fi
+}
+
 # ------------- Firewall detection -------------
 detect_firewalls() {
   local detected=()
@@ -70,6 +98,7 @@ load_env() {
   export RSYNC_BIN="${RSYNC_BIN:-$(command -v rsync || echo /usr/bin/rsync)}"
   export SYSCTL_BIN="${SYSCTL_BIN:-$(command -v sysctl || echo /usr/sbin/sysctl)}"
   export PUBLIC_IP_SERVICE="${PUBLIC_IP_SERVICE:-https://ifconfig.me}"
+  export PENDING_STABLE_CYCLES="${PENDING_STABLE_CYCLES:-2}"
 
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE" || true
   detect_firewalls
@@ -610,6 +639,10 @@ status_report() {
   local ports="${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}"
   ports="$(echo $ports)"
 
+  if [[ -f "$STATE_DIR/pending.hash" ]]; then
+    echo -e "${yellow}Configuração pendente: aguardando estabilização${reset}"
+  fi
+
   if has_outbound_internet; then
     echo -e "${green}Internet de saída: OK${reset}"
   else
@@ -702,29 +735,35 @@ daemon_loop() {
     local assessment
     assessment="$(detect_external_vs_internal || true)"
     log DEBUG "Diagnóstico: $assessment"
+    local streak
+    streak="$(cat "$STATE_DIR/normal_streak" 2>/dev/null || echo 0)"
     case "$assessment" in
       normal)
-      # Aceita alterações manuais apenas se conectividade estiver OK
-      local current_hash last_hash
-      current_hash="$(compute_current_hash || echo x)"
-      last_hash="$(cat "$STATE_DIR/last_good.hash" 2>/dev/null || echo y)"
-      if [[ "$current_hash" != "$last_hash" ]]; then
-        log INFO "Configuração alterada manualmente detectada e aceita."
-        echo "$current_hash" > "$STATE_DIR/last_good.hash"
-      fi
+        streak=$((streak + 1))
+        echo "$streak" > "$STATE_DIR/normal_streak"
+        local current_hash last_hash
+        current_hash="$(compute_current_hash || echo x)"
+        last_hash="$(cat "$STATE_DIR/last_good.hash" 2>/dev/null || echo y)"
+        if [[ "$current_hash" != "$last_hash" ]]; then
+          set_pending_hash "$current_hash"
+        fi
         ;;
       external)
+        echo 0 > "$STATE_DIR/normal_streak"
         log WARN "Problema de conectividade parece EXTERNO (provedor/rota). Nenhuma ação tomada."
         ;;
       internal)
+        echo 0 > "$STATE_DIR/normal_streak"
         log WARN "Problema de conectividade INTERNAMENTE detectado. Iniciando autorreparo..."
         ensure_ports_open
         attempt_restore_chain || true
         ;;
       *)
+        echo 0 > "$STATE_DIR/normal_streak"
         log DEBUG "Estado desconhecido."
         ;;
     esac
+    promote_pending_if_stable
 
     sleep "$MONITOR_INTERVAL_SECONDS"
   done
