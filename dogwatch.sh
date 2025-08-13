@@ -422,12 +422,13 @@ restore_snapshot() {
 
 compute_current_hash() {
   # Hash cumulativo das configs relevantes (arquivos + status ufw/nft + sshd)
-  local tmp
-  tmp="$(mktemp)"
+  local tmp; tmp="$(mktemp)"
   while read -r item; do
     [[ -z "$item" ]] && continue
     if [[ -e "$item" ]]; then
-      find "$item" -type f -exec sha256sum {} \; 2>/dev/null
+      find "$item" -type f -print0 2>/dev/null \
+      | sort -z \
+      | xargs -0 sha256sum 2>/dev/null
     fi
   done < <(backup_items_list) >> "$tmp" 2>/dev/null || true
 
@@ -549,7 +550,10 @@ listening_on_ports() {
   done
   if (( ${#missing[@]} )); then
     log DEBUG "Não está ouvindo em: ${missing[*]}"
-    command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null | grep -E '^port ' | xargs -I{} log DEBUG "sshd -T: {}" || true
+    command -v sshd >/dev/null 2>&1 && {
+      sshd -T 2>/dev/null | grep -E '^port ' \
+      | while IFS= read -r L; do log DEBUG "sshd -T: $L"; done
+    } || true
     echo "${missing[*]}"; return 1
   fi
   return 0
@@ -585,7 +589,7 @@ firewall_allows_ports() {
           local rules policy has_input_hook
           rules="$(nft list ruleset 2>/dev/null || true)"
           has_input_hook=0; echo "$rules" | grep -q 'hook input' && has_input_hook=1
-          policy="$(echo "$rules" | awk '$1=="chain" && $2=="input"{in=1} in&&/policy/{print tolower($0); exit}')"
+          policy="$(echo "$rules" | awk '$1=="chain" && $2=="input"{inchain=1} inchain && /policy/{print tolower($0); exit}')"
           # só exigir regra explícita se a chain input tiver hook e policy drop/reject
           if [[ $has_input_hook -eq 1 ]] && echo "$policy" | grep -Eq 'policy[[:space:]]+(drop|reject)'; then
             for p in $ports; do
@@ -792,31 +796,28 @@ ssh_safe_reload() {
 ssh_set_dual_port_mode() {
   load_env
   ensure_sshd_include
-  install -m 0644 /dev/stdin /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
+  cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
 Port $PRIMARY_SSH_PORT
 Port $EMERGENCY_SSH_PORT
 PasswordAuthentication yes
 PermitRootLogin yes
 EOF
+  chmod 0644 /etc/ssh/sshd_config.d/99-dogwatch.conf
+
+  printf "\nAddressFamily any\nListenAddress 0.0.0.0\nListenAddress ::\n" \
+    >> /etc/ssh/sshd_config.d/99-dogwatch.conf
 
   ssh_safe_reload || true
   sleep 1
+
   if ss_port_listens "$PRIMARY_SSH_PORT" && ss_port_listens "$EMERGENCY_SSH_PORT"; then
     return 0
   fi
 
-  # Força AF e bind amplo se ainda não abriu
-  sed -i '$a AddressFamily any\nListenAddress 0.0.0.0\nListenAddress ::' /etc/ssh/sshd_config.d/99-dogwatch.conf
-  ssh_safe_reload || true
-  sleep 1
-
-  if ss_port_listens "$PRIMARY_SSH_PORT" && ss_port_listens "$EMERGENCY_SSH_PORT"; then
-    return 0
-  fi
-
-  command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null \
-    | grep -E '^(port|listenaddress|addressfamily) ' \
-    | xargs -I{} log DEBUG "sshd -T: {}" || true
+  command -v sshd >/dev/null 2>&1 && {
+    sshd -T 2>/dev/null | grep -E '^(port|listenaddress|addressfamily) ' \
+    | while IFS= read -r L; do log DEBUG "sshd -T: $L"; done
+  } || true
   log ERROR "Ainda não escuta em $PRIMARY_SSH_PORT e/ou $EMERGENCY_SSH_PORT"
   return 1
 }
