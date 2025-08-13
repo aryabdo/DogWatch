@@ -93,6 +93,7 @@ load_env() {
   export LOG_LEVEL="${LOG_LEVEL:-INFO}"
   export PRIMARY_SSH_PORT="${PRIMARY_SSH_PORT:-16309}"
   export EMERGENCY_SSH_PORT="${EMERGENCY_SSH_PORT:-22}"
+  export ALLOW_USERS="${ALLOW_USERS:-aasn}"
   export RESTORE_EMERGENCY_PORTS="${RESTORE_EMERGENCY_PORTS:-16309}"
   export EMERGENCY_WINDOW_ON_000="${EMERGENCY_WINDOW_ON_000:-1}"
   export REQUIRE_ICMP_AND_HTTP="${REQUIRE_ICMP_AND_HTTP:-1}"
@@ -801,11 +802,11 @@ Port $PRIMARY_SSH_PORT
 Port $EMERGENCY_SSH_PORT
 PasswordAuthentication yes
 PermitRootLogin yes
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
 EOF
   chmod 0644 /etc/ssh/sshd_config.d/99-dogwatch.conf
-
-  printf "\nAddressFamily any\nListenAddress 0.0.0.0\nListenAddress ::\n" \
-    >> /etc/ssh/sshd_config.d/99-dogwatch.conf
 
   ssh_safe_reload || true
   sleep 1
@@ -845,8 +846,8 @@ ssh_set_restricted_mode() {
 Port $PRIMARY_SSH_PORT
 PasswordAuthentication yes
 PermitRootLogin no
-AllowUsers aasn
 EOF
+  [[ -n "${ALLOW_USERS:-}" ]] && echo "AllowUsers $ALLOW_USERS" >> /etc/ssh/sshd_config.d/99-dogwatch.conf
   ssh_safe_reload || true
   for fw in $FIREWALLS; do
     case "$fw" in

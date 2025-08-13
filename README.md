@@ -34,6 +34,9 @@ sudo systemctl restart dogwatch.service
 
 Se você usou o **one-liner**, repita o comando acima (ele baixa a última versão e reinstala).
 
+> **Dica**: se atualizar manualmente o binário `/opt/dogwatch/dogwatch.sh`, reinicie o serviço com
+> `sudo systemctl restart dogwatch` para que a nova versão seja carregada e evitar mensagens antigas.
+
 ## Remoção (mantém backups)
 ```bash
 sudo /opt/dogwatch/dogwatch.sh uninstall
