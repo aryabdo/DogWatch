@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -12,8 +12,10 @@ log() {
   local level="${1:-INFO}"; shift || true
   local msg="$*"
   [[ "${LOG_LEVEL:-INFO}" == "DEBUG" || "$level" != "DEBUG" ]] || return 0
-  mkdir -p "${LOG_DIR:-/var/log/dogwatch}"
-  echo "$(ts) [$level] $msg" | tee -a "${LOG_DIR:-/var/log/dogwatch}/$PROG.log" >/dev/null
+  local _dir="${LOG_DIR:-/var/log/dogwatch}"
+  mkdir -p "$_dir"
+  # Escreve direto no arquivo (sem pipe/tee) para evitar "Broken pipe"
+  printf "%s [%s] %s\n" "$(ts)" "$level" "$msg" >> "$_dir/$PROG.log"
 }
 
 require_root() {
@@ -50,14 +52,10 @@ promote_pending_if_stable() {
   local streak
   streak="$(cat "$STATE_DIR/normal_streak" 2>/dev/null || echo 0)"
   if (( streak >= PENDING_STABLE_CYCLES )); then
-    local pending_boot current_boot
-    pending_boot="$(cat "$STATE_DIR/pending.boot_id" 2>/dev/null || echo)"
-    current_boot="$(get_boot_id)"
-    if [[ -f "$STATE_DIR/admin_ack" || "$current_boot" != "$pending_boot" ]]; then
-      cp "$pending_file" "$STATE_DIR/last_good.hash"
-      rm -f "$pending_file" "$STATE_DIR/pending.boot_id" "$STATE_DIR/admin_ack"
-      log INFO "Configuração pendente promovida para last_good.hash."
-    fi
+    # Promoção automática após ciclos estáveis (não exige admin_ack nem reboot)
+    cp "$pending_file" "$STATE_DIR/last_good.hash"
+    rm -f "$pending_file" "$STATE_DIR/pending.boot_id" "$STATE_DIR/admin_ack"
+    log INFO "Configuração pendente promovida automaticamente para last_good.hash."
   fi
 }
 
@@ -122,6 +120,7 @@ load_env() {
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE" || true
   EMERGENCY_TTL_HOURS="${EMERGENCY_TTL_HOURS:-12}"
   EMERGENCY_TTL_HOURS="${EMERGENCY_TTL_HOURS//[^0-9]/}"
+  [[ -z "$EMERGENCY_TTL_HOURS" ]] && EMERGENCY_TTL_HOURS=12
   export EMERGENCY_TTL_HOURS
   detect_firewalls
 
@@ -219,7 +218,8 @@ install_self() {
   DEBIAN_FRONTEND=noninteractive apt-get update -y || true
   install_pkgs curl jq rsync netcat-openbsd iproute2 ufw nftables iptables openssh-server || \
     log WARN "Falha ao instalar pacotes base"
-  if ! install_pkgs wireguard-tools rclone ddclient dnsutils lsof nmap speedtest-cli; then
+  # Inclui iptables-persistent (item 5) para persistir regras caso iptables seja usado
+  if ! install_pkgs wireguard-tools rclone ddclient dnsutils lsof nmap speedtest-cli iptables-persistent; then
     log WARN "Falha ao instalar pacotes extras"
   fi
 
@@ -285,7 +285,7 @@ EOF
   first_run_bootstrap
 
   say "Instalação concluída."
-  say "Serviço iniciado." 
+  say "Serviço iniciado."
 }
 
 uninstall_self() {
@@ -443,7 +443,7 @@ restore_snapshot() {
   log INFO "Restaurando snapshot: $snap"
 
   # Desabilita firewalls antes de restaurar
-  safe_disable_firewalls
+  safe_disable_firewalls()
 
   # Restaura arquivos preservando paths completos
   rsync -a "$dir/files"/ / 2>/dev/null || true
@@ -465,7 +465,7 @@ restore_snapshot() {
 
   log INFO "Reiniciando servidor..."
   sleep 20
-  sudo reboot || reboot
+  reboot
 }
 
 compute_current_hash() {
@@ -535,10 +535,7 @@ has_outbound_internet() {
 }
 
 has_remote_access() {
-  # Verifica se portas obrigatórias estão acessíveis via IP público.
-  # Alguns ambientes não permitem testar o próprio IP público (hairpin NAT).
-  # Caso o teste remoto falhe, fazemos um fallback para IPs locais para evitar
-  # falsos negativos.
+  # Verifica se portas obrigatórias estão acessíveis via IP público (com fallback local)
   local ip require_public ports candidates used_fallback=0
   require_public="${REQUIRE_PUBLIC_REMOTE:-0}"
   ip="$($CURL_BIN -fsS "$PUBLIC_IP_SERVICE" 2>/dev/null | tr -d '\r\n' || echo)"
@@ -576,13 +573,18 @@ has_remote_access() {
   return 0
 }
 
-
+# (1) Detecção de porta mais robusta
 ss_port_listens() {
   local p="$1"
-  ss -H -ltn "( sport = :$p )" 2>/dev/null | grep -q . && return 0
-  # fallback robusto (IPv4/IPv6)
-  ss -ltnp 2>/dev/null | awk -v p="$p" '$1=="LISTEN"{gsub(/[\[\]]/,"",$4);
-    n=split($4,a,":"); if (a[n]==p){found=1; exit}} END{exit !found}' && return 0
+  # Filtro direto (algumas versões aceitam)
+  ss -H -ltn "sport = :$p" 2>/dev/null | grep -q . && return 0
+  # Saída plain, compatível com variações
+  ss -ltn 2>/dev/null | awk -v p="$p" '
+    $1=="LISTEN" {
+      gsub(/[\[\]]/,"",$4);
+      if ($4 ~ (":" p "$") || $4 ~ ("\\." p "$")) { found=1; exit }
+    }
+    END { exit !found }' && return 0
   $NC_BIN -w2 -z 127.0.0.1 "$p" >/dev/null 2>&1 && return 0
   $NC_BIN -w2 -z ::1 "$p"       >/dev/null 2>&1 && return 0
   return 1
@@ -640,7 +642,6 @@ firewall_allows_ports() {
           rules="$(nft list ruleset 2>/dev/null || true)"
           has_input_hook=0; echo "$rules" | grep -q 'hook input' && has_input_hook=1
           policy="$(echo "$rules" | awk '$1=="chain" && $2=="input"{inchain=1} inchain && /policy/{print tolower($0); exit}')"
-          # só exigir regra explícita se a chain input tiver hook e policy drop/reject
           if [[ $has_input_hook -eq 1 ]] && echo "$policy" | grep -Eq 'policy[[:space:]]+(drop|reject)'; then
             for p in $ports; do
               echo "$rules" | grep -qwE "tcp[[:space:]]+dport[[:space:]]+$p[[:space:]].*(accept|counter accept)" || blocked+=("$p")
@@ -653,7 +654,6 @@ firewall_allows_ports() {
           local rules policy
           rules="$(iptables -L INPUT -n 2>/dev/null || true)"
           policy="$(echo "$rules" | sed -n 's/^Chain INPUT (policy \([A-Z]*\)).*/\1/p')"
-          # Só exige regra explícita se a policy for DROP/REJECT
           if [[ "$policy" == "DROP" || "$policy" == "REJECT" ]]; then
             for p in $ports; do
               echo "$rules" | grep -qw "dpt:$p" || blocked+=("$p")
@@ -689,7 +689,6 @@ table inet dogwatch {
 EOF
     nft -f /etc/nftables.conf >/dev/null 2>&1 || true
   fi
-  # garante serviço nftables e aplica ruleset
   if systemctl list-unit-files 2>/dev/null | grep -q '^nftables\.service'; then
     systemctl enable --now nftables >/dev/null 2>&1 || true
   fi
@@ -711,10 +710,15 @@ ensure_ports_open() {
         ;;
       firewalld)
         if systemctl is-active --quiet firewalld 2>/dev/null; then
+          # (2) Recarregar apenas uma vez ao final
+          local changed=0
           for p in $ports; do
-            firewall-cmd --add-port="$p/tcp" --permanent || true
-            firewall-cmd --reload || true
+            firewall-cmd --query-port="$p/tcp" --permanent >/dev/null 2>&1 || {
+              firewall-cmd --add-port="$p/tcp" --permanent || true
+              changed=1
+            }
           done
+          ((changed)) && firewall-cmd --reload || true
         fi
         ;;
       nftables)
@@ -742,6 +746,8 @@ ensure_ports_open() {
           for p in $ports; do
             iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$p" -j ACCEPT || true
           done
+          # (5) Persistir regras se iptables for usado
+          command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
         fi
         ;;
     esac
@@ -814,12 +820,13 @@ EOF
         fi
         ;;
       nftables)
-        command -v nft >/dev/null 2>&1 && nft flush table inet dogwatch 2>/dev/null || true
+        command -v nft >/dev/null 2>&1 && nft flush chain inet dogwatch input 2>/dev/null || true
         ;;
       iptables)
         if command -v iptables >/dev/null 2>&1; then
           iptables -F 2>/dev/null || true
           iptables -X 2>/dev/null || true
+          command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
         fi
         ;;
     esac
@@ -911,7 +918,8 @@ EOF
       nftables)
         command -v nft >/dev/null 2>&1 && nft flush chain inet dogwatch input 2>/dev/null || true ;;
       iptables)
-        command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p tcp --dport "$EMERGENCY_SSH_PORT" -j ACCEPT 2>/dev/null || true ;;
+        command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p tcp --dport "$EMERGENCY_SSH_PORT" -j ACCEPT 2>/dev/null || true
+        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true ;;
     esac
   done
   ensure_ports_open "$PRIMARY_SSH_PORT"
@@ -1000,47 +1008,30 @@ EOF
 }
 
 detect_external_vs_internal() {
-  # Retorna 0 se parece externo, 1 se interno
-  # Heurística: sem internet de saída E hash de configs não mudou => externo
-  # Se hash mudou OU firewall/sshd listening problem OU acesso remoto falhou => interno
+  # Retorna: normal (2), degradado (3), internal (1), external (0)
   if has_outbound_internet; then
-    # Tem internet: se portas não estão abertas/listening, firewall bloqueia ou acesso remoto falha => interno
     local ports="$MANDATORY_OPEN_PORTS"
     ports="$(echo $ports)"
     if listening_on_ports $ports && firewall_allows_ports $ports; then
       has_remote_access
       case $? in
-        0)
-          echo "normal"
-          return 2
-          ;;
-        2)
-          echo "degradado"
-          return 3
-          ;;
-        *)
-          echo "internal"
-          return 1
-          ;;
+        0) echo "normal"; return 2 ;;
+        2) echo "degradado"; return 3 ;;
+        *) echo "internal"; return 1 ;;
       esac
     else
-      echo "internal"
-      return 1
+      echo "internal"; return 1
     fi
   else
-    # Sem saída: compara hash
     local current="$(compute_current_hash || echo "x")"
     local last_good="$(cat "$STATE_DIR/last_good.hash" 2>/dev/null || echo "y")"
     if [[ "$current" == "$last_good" ]]; then
-      echo "external"
-      return 0
+      echo "external"; return 0
     else
-      echo "internal"
-      return 1
+      echo "internal"; return 1
     fi
   fi
 }
-
 
 status_report() {
   if ! systemctl is-active --quiet "$PROG.service" 2>/dev/null; then
@@ -1206,7 +1197,7 @@ daemon_loop() {
   local last_backup_ts=0
   while true; do
     ssh_check_ttl_and_restrict_if_needed
-    # Backups rotativos a cada 30 min
+    # Backups rotativos
     local now
     now="$(date +%s)"
     if (( now - last_backup_ts >= BACKUP_INTERVAL_SECONDS )); then
@@ -1215,7 +1206,7 @@ daemon_loop() {
       log INFO "Backup automático concluído."
     fi
 
-    # Monitoramento de 5 em 5 min (mas o loop pode rodar mais frequente)
+    # Monitoramento
     local assessment
     assessment="$(detect_external_vs_internal || true)"
     log DEBUG "Diagnóstico: $assessment"
@@ -1334,7 +1325,6 @@ EOF
             if echo " $EXTRA_PORTS " | grep -q " $p "; then
               EXTRA_PORTS="$(echo "$EXTRA_PORTS" | tr ' ' '\n' | grep -v "^$p$" | xargs)"
               sed -i "s/^EXTRA_PORTS=.*/EXTRA_PORTS=\"$EXTRA_PORTS\"/" "$ENV_FILE"
-              # UFW remove rule
               LC_ALL=C LANG=C ufw delete allow "$p/tcp" || true
               echo "Porta $p removida de EXTRA_PORTS e bloqueada no UFW (se presente)."
             else
