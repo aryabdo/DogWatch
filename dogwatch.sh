@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.2.2"
+VERSION="1.2.4"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -14,7 +14,6 @@ log() {
   [[ "${LOG_LEVEL:-INFO}" == "DEBUG" || "$level" != "DEBUG" ]] || return 0
   local _dir="${LOG_DIR:-/var/log/dogwatch}"
   mkdir -p "$_dir"
-  # Escreve direto no arquivo (sem pipe/tee) para evitar "Broken pipe"
   printf "%s [%s] %s\n" "$(ts)" "$level" "$msg" >> "$_dir/$PROG.log"
 }
 
@@ -52,7 +51,6 @@ promote_pending_if_stable() {
   local streak
   streak="$(cat "$STATE_DIR/normal_streak" 2>/dev/null || echo 0)"
   if (( streak >= PENDING_STABLE_CYCLES )); then
-    # Promoção automática após ciclos estáveis (não exige admin_ack nem reboot)
     cp "$pending_file" "$STATE_DIR/last_good.hash"
     rm -f "$pending_file" "$STATE_DIR/pending.boot_id" "$STATE_DIR/admin_ack"
     log INFO "Configuração pendente promovida automaticamente para last_good.hash."
@@ -63,7 +61,7 @@ promote_pending_if_stable() {
 detect_firewalls() {
   local detected=()
   command -v ufw >/dev/null 2>&1 && detected+=(ufw)
-  systemctl list-unit-files 2>/dev/null | grep -q '^firewalld.service' && detected+=(firewalld)
+  systemctl list-unit-files 2>/dev/null | grep -q '^firewalld\.service' && detected+=(firewalld)
   command -v nft >/dev/null 2>&1 && detected+=(nftables)
   command -v iptables >/dev/null 2>&1 && detected+=(iptables)
   FIREWALLS="${FIREWALLS:-}"
@@ -83,7 +81,6 @@ mkdir -p /etc/dogwatch || true
 
 # ------------- Load env -------------
 load_env() {
-  # Defaults
   export DATA_DIR="${DATA_DIR:-$DATA_DIR_DEFAULT}"
   export BACKUP_DIR="${BACKUP_DIR:-$BACKUP_DIR_DEFAULT}"
   export LOG_DIR="${LOG_DIR:-$LOG_DIR_DEFAULT}"
@@ -132,10 +129,8 @@ enforce_primary_ssh_port_early() {
   load_env
   say "Configurando SSH para porta ${PRIMARY_SSH_PORT} (e ${EMERGENCY_SSH_PORT})…"
 
-  # Garante include de drop-ins
   ensure_sshd_include
 
-  # Drop-in controlado pelo DogWatch
   cat > /etc/ssh/sshd_config.d/99-dogwatch.conf <<EOF
 # Managed by dogwatch
 AddressFamily any
@@ -148,19 +143,16 @@ PermitRootLogin yes
 EOF
   chmod 0644 /etc/ssh/sshd_config.d/99-dogwatch.conf || true
 
-  # SELinux (RHEL-like): liberar porta não padrão do sshd, se presente
   if command -v semanage >/dev/null 2>&1; then
     semanage port -a -t ssh_port_t -p tcp "${PRIMARY_SSH_PORT}" 2>/dev/null || \
     semanage port -m -t ssh_port_t -p tcp "${PRIMARY_SSH_PORT}" 2>/dev/null || true
   fi
 
-  # Evita conflito com socket activation
   if systemctl list-unit-files | grep -q '^ssh\.socket'; then
     systemctl disable --now ssh.socket >/dev/null 2>&1 || true
   fi
 
   systemctl daemon-reload || true
-  # Habilita/ativa o serviço de acordo com o nome da distro
   if systemctl list-unit-files | grep -q '^ssh\.service'; then
     systemctl enable --now ssh >/dev/null 2>&1 || true
     systemctl restart ssh >/dev/null 2>&1 || true
@@ -172,7 +164,6 @@ EOF
 
   ssh_safe_reload || true
 
-  # Espera a porta subir
   for i in {1..10}; do
     if ss_port_listens "$PRIMARY_SSH_PORT"; then
       log INFO "sshd escutando em ${PRIMARY_SSH_PORT}"
@@ -218,15 +209,13 @@ install_self() {
   DEBIAN_FRONTEND=noninteractive apt-get update -y || true
   install_pkgs curl jq rsync netcat-openbsd iproute2 ufw nftables iptables openssh-server || \
     log WARN "Falha ao instalar pacotes base"
-  # Inclui iptables-persistent (item 5) para persistir regras caso iptables seja usado
+  # extras + persistência iptables
   if ! install_pkgs wireguard-tools rclone ddclient dnsutils lsof nmap speedtest-cli iptables-persistent; then
     log WARN "Falha ao instalar pacotes extras"
   fi
 
-  # === PRIMEIRO: fixar porta SSH e abrir firewall ===
   enforce_primary_ssh_port_early
   ensure_ports_open "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
-  # ==================================================
 
   say "Instalando arquivos..."
   mkdir -p "$DATA_DIR"
@@ -307,7 +296,6 @@ uninstall_self() {
 
 # ------------- Backup/Restore -------------
 backup_items_list() {
-  # Lista de caminhos/artefatos a incluir
   cat <<'EOF'
 /etc/hosts
 /etc/hostname
@@ -343,7 +331,6 @@ EOF
 }
 
 snapshot_commands() {
-  # Comandos cujas saídas serão salvas para diagnóstico
   cat <<'EOF'
 ip a
 ip r
@@ -368,7 +355,6 @@ backup_snapshot() {
   local dir="$BACKUP_DIR/$stamp-$label"
   mkdir -p "$dir/files" "$dir/cmd" "$dir/meta"
 
-  # Copia arquivos/diretórios existentes
   while read -r item; do
     [[ -z "$item" ]] && continue
     if [[ -e "$item" || "$item" == *"*"* ]]; then
@@ -376,25 +362,20 @@ backup_snapshot() {
     fi
   done < <(backup_items_list)
 
-  # Saídas de comandos
   while read -r cmd; do
     [[ -z "$cmd" ]] && continue
     sh -c "$cmd" > "$dir/cmd/$(echo "$cmd" | tr ' /@*' '____').txt" 2>&1 || true
   done < <(snapshot_commands)
 
-  # Metadados
   (uname -a; lsb_release -a 2>/dev/null || true; date) > "$dir/meta/system.txt"
   (command -v curl >/dev/null 2>&1 && { curl -s https://api.ipify.org || true; echo; }) > "$dir/meta/public_ip.txt" || true
   echo "$VERSION" > "$dir/meta/$PROG.version"
 
-  # Atualiza rotação (mantém 10, preserva 0.0)
   rotate_backups
-
   echo "$dir"
 }
 
 rotate_backups() {
-  # Mantém MAX_ROTATING_BACKUPS mais recentes, preservando backup 0.0
   local keep="$MAX_ROTATING_BACKUPS"
   mapfile -t snaps < <(find "$BACKUP_DIR" -maxdepth 1 -type d -printf "%P\n" | sort -r)
   local count=0
@@ -413,7 +394,6 @@ first_run_bootstrap() {
     mkdir -p "$BACKUP_DIR/000-initial"
     local path
     path="$(backup_snapshot "backup-0.0")"
-    # Move conteúdo para 000-initial
     shopt -s dotglob
     mv "$path"/* "$BACKUP_DIR/000-initial"/ 2>/dev/null || true
     rmdir "$path" || true
@@ -422,7 +402,6 @@ first_run_bootstrap() {
   else
     log DEBUG "Backup 0.0 já existe."
   fi
-  # Salva hash da última configuração 'boa'
   compute_current_hash > "$STATE_DIR/last_good.hash" || true
 }
 
@@ -442,13 +421,10 @@ restore_snapshot() {
   fi
   log INFO "Restaurando snapshot: $snap"
 
-  # Desabilita firewalls antes de restaurar
   safe_disable_firewalls
 
-  # Restaura arquivos preservando paths completos
   rsync -a "$dir/files"/ / 2>/dev/null || true
 
-  # Reaplica configurações de rede para garantir conectividade
   if command -v netplan >/dev/null 2>&1; then
     netplan generate >/dev/null 2>&1 || true
     netplan apply || true
@@ -469,7 +445,6 @@ restore_snapshot() {
 }
 
 compute_current_hash() {
-  # Hash cumulativo das configs relevantes (arquivos + status ufw/nft + sshd)
   local tmp; tmp="$(mktemp)"
   while read -r item; do
     [[ -z "$item" ]] && continue
@@ -503,7 +478,6 @@ connectivity_healthy() {
 
 # ------------- Connectivity Checks -------------
 has_outbound_internet() {
-  # Testa ping ICMP e HTTP com múltiplos alvos e retries
   local ping_ok=1 http_ok=1
   for ip in $PING_TARGETS; do
     for _ in {1..3}; do
@@ -535,7 +509,6 @@ has_outbound_internet() {
 }
 
 has_remote_access() {
-  # Verifica se portas obrigatórias estão acessíveis via IP público (com fallback local)
   local ip require_public ports candidates used_fallback=0
   require_public="${REQUIRE_PUBLIC_REMOTE:-0}"
   ip="$($CURL_BIN -fsS "$PUBLIC_IP_SERVICE" 2>/dev/null | tr -d '\r\n' || echo)"
@@ -576,9 +549,7 @@ has_remote_access() {
 # (1) Detecção de porta mais robusta
 ss_port_listens() {
   local p="$1"
-  # Filtro direto (algumas versões aceitam)
   ss -H -ltn "sport = :$p" 2>/dev/null | grep -q . && return 0
-  # Saída plain, compatível com variações
   ss -ltn 2>/dev/null | awk -v p="$p" '
     $1=="LISTEN" {
       gsub(/[\[\]]/,"",$4);
@@ -618,11 +589,12 @@ firewall_allows_ports() {
     case "$fw" in
       ufw)
         if command -v ufw >/dev/null 2>&1; then
+          hash -r
           local status
           status="$(LC_ALL=C LANG=C ufw status 2>/dev/null || true)"
-          if echo "$status" | grep -q '^Status: active'; then
+          if grep -q '^Status: active' <<< "$status"; then
             for p in $ports; do
-              echo "$status" | awk -v port="${p}/tcp" '($1==port || $1==port" (v6)") && $2 ~ /^ALLOW/ {found=1} END {exit !found}' || blocked+=("$p")
+              awk -v port="${p}/tcp" '($1==port || $1==port" (v6)") && $2 ~ /^ALLOW/ {found=1} END {exit !found}' <<< "$status" || blocked+=("$p")
             done
           fi
         fi
@@ -632,7 +604,7 @@ firewall_allows_ports() {
           local plist
           plist="$(firewall-cmd --permanent --list-ports 2>/dev/null || true)"
           for p in $ports; do
-            echo "$plist" | grep -qw "${p}/tcp" || blocked+=("$p")
+            grep -qw "${p}/tcp" <<< "$plist" || blocked+=("$p")
           done
         fi
         ;;
@@ -640,11 +612,11 @@ firewall_allows_ports() {
         if command -v nft >/dev/null 2>&1; then
           local rules policy has_input_hook
           rules="$(nft list ruleset 2>/dev/null || true)"
-          has_input_hook=0; echo "$rules" | grep -q 'hook input' && has_input_hook=1
-          policy="$(echo "$rules" | awk '$1=="chain" && $2=="input"{inchain=1} inchain && /policy/{print tolower($0); exit}')"
-          if [[ $has_input_hook -eq 1 ]] && echo "$policy" | grep -Eq 'policy[[:space:]]+(drop|reject)'; then
+          has_input_hook=0; grep -q 'hook input' <<< "$rules" && has_input_hook=1
+          policy="$(awk '$1=="chain" && $2=="input"{inchain=1} inchain && /policy/{print tolower($0); exit}' <<< "$rules")"
+          if [[ $has_input_hook -eq 1 ]] && grep -Eq 'policy[[:space:]]+(drop|reject)' <<< "$policy"; then
             for p in $ports; do
-              echo "$rules" | grep -qwE "tcp[[:space:]]+dport[[:space:]]+$p[[:space:]].*(accept|counter accept)" || blocked+=("$p")
+              grep -qwE "tcp[[:space:]]+dport[[:space:]]+$p[[:space:]].*(accept|counter accept)" <<< "$rules" || blocked+=("$p")
             done
           fi
         fi
@@ -653,10 +625,10 @@ firewall_allows_ports() {
         if command -v iptables >/dev/null 2>&1; then
           local rules policy
           rules="$(iptables -L INPUT -n 2>/dev/null || true)"
-          policy="$(echo "$rules" | sed -n 's/^Chain INPUT (policy \([A-Z]*\)).*/\1/p')"
+          policy="$(sed -n 's/^Chain INPUT (policy \([A-Z]*\)).*/\1/p' <<< "$rules")"
           if [[ "$policy" == "DROP" || "$policy" == "REJECT" ]]; then
             for p in $ports; do
-              echo "$rules" | grep -qw "dpt:$p" || blocked+=("$p")
+              grep -qw "dpt:$p" <<< "$rules" || blocked+=("$p")
             done
           fi
         fi
@@ -697,28 +669,35 @@ EOF
 
 ensure_ports_open() {
   local ports="${*:-${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}}"
-  ports="$(echo $ports)" # normaliza espaços
+  ports="$(echo $ports)"
+
   for fw in $FIREWALLS; do
     case "$fw" in
       ufw)
         if command -v ufw >/dev/null 2>&1; then
-          LC_ALL=C LANG=C ufw --force enable || true
-          for p in $ports; do
-            LC_ALL=C LANG=C ufw allow "$p/tcp" || true
-          done
+          hash -r
+          if [[ "${UFW_DEFER_ENABLE:-0}" == "1" ]]; then
+            for p in $ports; do
+              LC_ALL=C LANG=C ufw allow "$p/tcp" >/dev/null 2>&1 || true
+            done
+          else
+            LC_ALL=C LANG=C ufw --force enable >/dev/null 2>&1 || true
+            for p in $ports; do
+              LC_ALL=C LANG=C ufw allow "$p/tcp" >/dev/null 2>&1 || true
+            done
+          fi
         fi
         ;;
       firewalld)
         if systemctl is-active --quiet firewalld 2>/dev/null; then
-          # (2) Recarregar apenas uma vez ao final
           local changed=0
           for p in $ports; do
             firewall-cmd --query-port="$p/tcp" --permanent >/dev/null 2>&1 || {
-              firewall-cmd --add-port="$p/tcp" --permanent || true
+              firewall-cmd --add-port="$p/tcp" --permanent >/dev/null 2>&1 || true
               changed=1
             }
           done
-          ((changed)) && firewall-cmd --reload || true
+          ((changed)) && firewall-cmd --reload >/dev/null 2>&1 || true
         fi
         ;;
       nftables)
@@ -727,7 +706,7 @@ ensure_ports_open() {
           local rules=""
           for p in $ports; do
             nft list chain inet dogwatch input 2>/dev/null | grep -qw "tcp dport $p accept" || \
-              nft add rule inet dogwatch input tcp dport "$p" accept 2>/dev/null || true
+              nft add rule inet dogwatch input tcp dport "$p" accept >/dev/null 2>&1 || true
             rules+="    tcp dport $p accept\n"
           done
           {
@@ -746,7 +725,6 @@ ensure_ports_open() {
           for p in $ports; do
             iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "$p" -j ACCEPT || true
           done
-          # (5) Persistir regras se iptables for usado
           command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
         fi
         ;;
@@ -755,7 +733,6 @@ ensure_ports_open() {
 }
 
 safe_disable_firewalls() {
-  # Desativa firewalls se atrapalham conectividade (apenas durante restauração)
   for fw in $FIREWALLS; do
     case "$fw" in
       ufw)
@@ -780,7 +757,6 @@ safe_disable_firewalls() {
 ensure_sshd_include() {
   local main="/etc/ssh/sshd_config" incdir="/etc/ssh/sshd_config.d"
   install -d -m 0755 "$incdir"
-  # remove duplicatas
   sed -i '/^[[:space:]]*Include[[:space:]]\+\/etc\/ssh\/sshd_config\.d\/\*\.conf[[:space:]]*$/d' "$main"
   if grep -q '^[[:space:]]*Match[[:space:]]' "$main"; then
     local ln; ln="$(grep -n '^[[:space:]]*Match[[:space:]]' "$main" | head -n1 | cut -d: -f1)"
@@ -1008,7 +984,6 @@ EOF
 }
 
 detect_external_vs_internal() {
-  # Retorna: normal (2), degradado (3), internal (1), external (0)
   if has_outbound_internet; then
     local ports="$MANDATORY_OPEN_PORTS"
     ports="$(echo $ports)"
@@ -1108,18 +1083,88 @@ status_report() {
 
   local state="$(detect_external_vs_internal || true)"
   case "$state" in
-    normal)
-      echo -e "${green}Status geral: normal${reset}"
-      ;;
-    internal)
-      echo -e "${red}Status geral: interno - verificar serviços/firewall ou restaurar backup${reset}"
-      ;;
-    degradado)
-      echo -e "${yellow}Status geral: degradado - possível hairpin NAT${reset}"
-      ;;
-    external)
-      echo -e "${yellow}Status geral: external - possível falha de provedor/rota${reset}"
-      ;;
+    normal)    echo -e "${green}Status geral: normal${reset}" ;;
+    internal)  echo -e "${red}Status geral: interno - verificar serviços/firewall ou restaurar backup${reset}" ;;
+    degradado) echo -e "${yellow}Status geral: degradado - possível hairpin NAT${reset}" ;;
+    external)  echo -e "${yellow}Status geral: external - possível falha de provedor/rota${reset}" ;;
+  esac
+}
+
+# ---------- Diagnóstico resumido (opção 9) ----------
+diagnostics_summary() {
+  load_env
+  local green='\033[32m' yellow='\033[33m' red='\033[31m' reset='\033[0m'
+
+  if has_outbound_internet; then
+    echo -e "${green}Internet de saída: OK${reset}"
+  else
+    echo -e "${red}Internet de saída: FALHA${reset}"
+  fi
+
+  has_remote_access; rc=$?
+  case $rc in
+    0) echo -e "${green}Acesso remoto: OK${reset}" ;;
+    2) echo -e "${yellow}Acesso remoto: DEGRADADO (fallback local)${reset}" ;;
+    *) echo -e "${red}Acesso remoto: FALHA${reset}" ;;
+  esac
+
+  local ports="$(echo $MANDATORY_OPEN_PORTS)"
+  if missing=$(listening_on_ports $ports); then
+    echo -e "${green}Portas ouvindo: $ports${reset}"
+  else
+    echo -e "${red}Portas faltando: $missing${reset}"
+  fi
+
+  detect_firewalls
+  if firewall_allows_ports $ports; then
+    echo -e "${green}Firewall permite portas necessárias${reset}"
+  else
+    echo -e "${yellow}Firewall pode estar bloqueando portas${reset}"
+  fi
+
+  for fw in $FIREWALLS; do
+    case "$fw" in
+      ufw)
+        if command -v ufw >/dev/null 2>&1; then
+          if systemctl is-active --quiet ufw 2>/dev/null; then
+            echo "UFW: ativo"
+          else
+            echo "UFW: instalado, inativo"
+          fi
+        else
+          echo "UFW: ausente"
+        fi ;;
+      firewalld)
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+          echo "firewalld: ativo"
+        else
+          echo "firewalld: inativo/ausente"
+        fi ;;
+      nftables)
+        if command -v nft >/dev/null 2>&1; then
+          if systemctl list-unit-files 2>/dev/null | grep -q '^nftables\.service' && systemctl is-active --quiet nftables 2>/dev/null; then
+            echo "nftables: ativo"
+          else
+            echo "nftables: disponível (serviço não ativo)"
+          fi
+        else
+          echo "nftables: ausente"
+        fi ;;
+      iptables)
+        if command -v iptables >/dev/null 2>&1; then
+          echo "iptables: disponível"
+        else
+          echo "iptables: ausente"
+        fi ;;
+    esac
+  done
+
+  local state="$(detect_external_vs_internal || true)"
+  case "$state" in
+    normal)    echo -e "${green}Status geral: normal${reset}" ;;
+    degradado) echo -e "${yellow}Status geral: degradado${reset}" ;;
+    internal)  echo -e "${red}Status geral: interno${reset}" ;;
+    external)  echo -e "${yellow}Status geral: external${reset}" ;;
   esac
 }
 
@@ -1135,7 +1180,6 @@ setup_restore_queue() {
 
 attempt_restore_queue() {
   load_env
-  [[ -f "$STATE_DIR/restore_queue.exhausted" ]] && { log WARN "Fila de restauração já esgotada."; return 1; }
   [[ -f "$STATE_DIR/restore_queue.txt" ]] || setup_restore_queue
   local idx total snap
   idx="$(cat "$STATE_DIR/restore_index" 2>/dev/null || echo 0)"
@@ -1143,7 +1187,6 @@ attempt_restore_queue() {
   if (( idx >= total )); then
     log WARN "Fila de restauração esgotada."
     rm -f "$STATE_DIR/restore_queue.txt" "$STATE_DIR/restore_index"
-    touch "$STATE_DIR/restore_queue.exhausted"
     return 1
   fi
   snap="$(sed -n "$((idx+1))p" "$STATE_DIR/restore_queue.txt")"
@@ -1163,9 +1206,9 @@ finalize_restore_queue() {
   if [[ -f "$STATE_DIR/restore_queue.txt" ]]; then
     if has_outbound_internet; then
       compute_current_hash > "$STATE_DIR/last_good.hash" || true
+      # Reset total da fila após estabilização
       rm -f "$STATE_DIR/restore_queue.txt" "$STATE_DIR/restore_index"
-      touch "$STATE_DIR/restore_queue.exhausted"
-      log INFO "Fila de restauração concluída com sucesso"
+      log INFO "Fila de restauração finalizada e resetada após estabilização"
       if [[ "${STOP_SERVICE_ON_SUCCESS:-0}" == "1" ]]; then
         systemctl disable --now "$PROG.service" || true
       fi
@@ -1184,9 +1227,7 @@ daemon_loop() {
   fi
   say "Iniciando daemon $PROG v$VERSION"
   log INFO "DogWatch versão $VERSION (bin: $(readlink -f "$0"))"
-  # Garante backup inicial
   first_run_bootstrap
-  # Valida portas e configuração do SSH antes do monitoramento
   ensure_ports_open
   if ! ssh_set_dual_port_mode; then
     log WARN "SSHD não validado; tentando apenas abrir firewall"
@@ -1197,7 +1238,6 @@ daemon_loop() {
   local last_backup_ts=0
   while true; do
     ssh_check_ttl_and_restrict_if_needed
-    # Backups rotativos
     local now
     now="$(date +%s)"
     if (( now - last_backup_ts >= BACKUP_INTERVAL_SECONDS )); then
@@ -1206,7 +1246,6 @@ daemon_loop() {
       log INFO "Backup automático concluído."
     fi
 
-    # Monitoramento
     local assessment
     assessment="$(detect_external_vs_internal || true)"
     log DEBUG "Diagnóstico: $assessment"
@@ -1325,16 +1364,21 @@ EOF
             if echo " $EXTRA_PORTS " | grep -q " $p "; then
               EXTRA_PORTS="$(echo "$EXTRA_PORTS" | tr ' ' '\n' | grep -v "^$p$" | xargs)"
               sed -i "s/^EXTRA_PORTS=.*/EXTRA_PORTS=\"$EXTRA_PORTS\"/" "$ENV_FILE"
-              LC_ALL=C LANG=C ufw delete allow "$p/tcp" || true
-              echo "Porta $p removida de EXTRA_PORTS e bloqueada no UFW (se presente)."
+              if command -v ufw >/dev/null 2>&1; then
+                LC_ALL=C LANG=C ufw delete allow "$p/tcp" || true
+              fi
+              echo "Porta $p removida de EXTRA_PORTS e (se UFW presente) bloqueada."
             else
               echo "Porta não está em EXTRA_PORTS."
             fi ;;
           c)
             ss -lntup || true
             echo
-            LC_ALL=C LANG=C ufw status verbose || true
-            ;;
+            if command -v ufw >/dev/null 2>&1; then
+              LC_ALL=C LANG=C ufw status verbose 2>/dev/null || true
+            else
+              echo "UFW: não instalado"
+            fi ;;
         esac
         read -rp "Enter para continuar..." _ ;;
       7)
@@ -1346,8 +1390,8 @@ EOF
         echo "c) Parar e desabilitar firewalld"
         read -rp "Opção: " fo
         case "$fo" in
-          a) LC_ALL=C LANG=C ufw --force enable; ensure_ports_open; echo "UFW ativado." ;;
-          b) LC_ALL=C LANG=C ufw --force disable; echo "UFW desativado." ;;
+          a) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw --force enable; ensure_ports_open; echo "UFW ativado."; else echo "UFW não instalado."; fi ;;
+          b) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw --force disable; echo "UFW desativado."; else echo "UFW não instalado."; fi ;;
           c) systemctl stop firewalld || true; systemctl disable firewalld || true; echo "firewalld desativado." ;;
         esac
         read -rp "Enter para continuar..." _ ;;
@@ -1359,20 +1403,14 @@ EOF
         echo "d) Listar regras numeradas"
         read -rp "Opção: " lo
         case "$lo" in
-          a) read -rp "IP/CIDR para permitir: " ip; LC_ALL=C LANG=C ufw allow from "$ip" || true ;;
-          b) read -rp "IP/CIDR para negar: " ip; LC_ALL=C LANG=C ufw deny from "$ip" || true ;;
-          c) LC_ALL=C LANG=C ufw status numbered; read -rp "Número da regra para deletar: " n; yes | LC_ALL=C LANG=C ufw delete "$n" || true ;;
-          d) LC_ALL=C LANG=C ufw status numbered || true ;;
+          a) read -rp "IP/CIDR para permitir: " ip; if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw allow from "$ip" || true; else echo "UFW não instalado."; fi ;;
+          b) read -rp "IP/CIDR para negar: " ip; if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw deny from "$ip" || true; else echo "UFW não instalado."; fi ;;
+          c) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw status numbered; read -rp "Número da regra para deletar: " n; yes | LC_ALL=C LANG=C ufw delete "$n" || true; else echo "UFW não instalado."; fi ;;
+          d) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw status numbered || true; else echo "UFW não instalado."; fi ;;
         esac
         read -rp "Enter para continuar..." _ ;;
       9)
-        status_report
-        echo
-        echo "Ping/HTTP:"
-        has_outbound_internet && echo "Internet de saída: OK" || echo "Internet de saída: FALHA"
-        echo "Listening (ss):"; ss -lntup || true
-        echo "UFW:"; LC_ALL=C LANG=C ufw status verbose || true
-        echo "nft:"; nft list ruleset || true
+        diagnostics_summary
         read -rp "Enter para continuar..." _ ;;
       10)
         command -v speedtest >/dev/null 2>&1 && speedtest || speedtest-cli || true
