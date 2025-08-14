@@ -18,13 +18,7 @@ apt_quiet_install() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >/dev/null 2>&1 || true
 }
 
-ufw_disable_safely() {
-  if have_cmd ufw; then
-    say "Desativando UFW temporariamente..."
-    LC_ALL=C LANG=C ufw --force disable >/dev/null 2>&1 || true
-  fi
-}
-
+# --- portas a partir do config.env (se existir) ---
 read_ports_from_env() {
   local env_file="/etc/dogwatch/config.env"
   PRIMARY_SSH_PORT="16309"
@@ -36,6 +30,14 @@ read_ports_from_env() {
     EMERGENCY_SSH_PORT="${EMERGENCY_SSH_PORT:-22}"
   fi
   export PRIMARY_SSH_PORT EMERGENCY_SSH_PORT
+}
+
+# --- UFW helpers ---
+ufw_disable_safely() {
+  if have_cmd ufw; then
+    say "Desativando UFW temporariamente..."
+    LC_ALL=C LANG=C ufw --force disable >/dev/null 2>&1 || true
+  fi
 }
 
 ufw_enable_with_ports() {
@@ -73,6 +75,7 @@ ufw_enable_with_ports() {
   fi
 }
 
+# --- checagem de porta de escuta ---
 check_listen_port() {
   local port="$1"
   if have_cmd ss; then
@@ -90,8 +93,8 @@ check_listen_port() {
   fi
 }
 
+# --- instala a partir do diretório atual ou clona o repo ---
 install_from_here_or_clone() {
-  # Se o dogwatch.sh está neste diretório, usa local; senão, clona o repositório
   if [[ -f "./dogwatch.sh" ]]; then
     say "Instalando a partir do diretório atual..."
     bash ./dogwatch.sh install
@@ -106,8 +109,8 @@ install_from_here_or_clone() {
   fi
 }
 
+# --- cria a unit Early Safelane (executa ensure-ports antes da rede) ---
 write_safelane_unit() {
-  # Unit que garante 'ensure-ports' ANTES da rede subir
   cat >/etc/systemd/system/dogwatch-safelane.service <<'UNIT'
 [Unit]
 Description=DogWatch Early Safelane (abre portas críticas antes da rede)
@@ -138,7 +141,7 @@ main() {
 
   # Pré-requisitos
   apt-get update -y >/dev/null 2>&1 || true
-  apt_quiet_install curl ca-certificates iproute2 netcat-openbsd jq rsync openssh-server nftables iptables
+  apt_quiet_install curl ca-certificates iproute2 netcat-openbsd jq rsync openssh-server nftables iptables ufw git
 
   # (opcional) segurar firewalld para evitar conflitos
   if command -v apt-mark >/dev/null 2>&1; then apt-mark hold firewalld >/dev/null 2>&1 || true; fi
