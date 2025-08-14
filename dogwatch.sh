@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.2.6"
+VERSION="1.2.7"
 PROG="dogwatch"
 
 # ------------- Helpers -------------
@@ -30,7 +30,7 @@ detect_firewalls() {
   systemctl list-unit-files 2>/dev/null | grep -q '^firewalld\.service' && detected+=(firewalld)
   command -v nft >/dev/null 2>&1 && detected+=(nftables)
   command -v iptables >/dev/null 2>&1 && detected+=(iptables)
-  # extras comuns (não fazem nada se não existirem)
+  # extras comuns
   systemctl list-unit-files 2>/dev/null | grep -q '^shorewall\.service' && detected+=(shorewall)
   command -v csf >/dev/null 2>&1 && detected+=(csf)
   command -v ferm >/dev/null 2>&1 && detected+=(ferm)
@@ -92,7 +92,7 @@ load_env() {
   export STRICT_PENDING_CONNECTIVITY="${STRICT_PENDING_CONNECTIVITY:-1}"
   export STOP_SERVICE_ON_SUCCESS="${STOP_SERVICE_ON_SUCCESS:-0}"
 
-  # Novos tunables (usados onde aplicável)
+  # Tunables novos
   export FIREWALL_APPLY_RETRIES="${FIREWALL_APPLY_RETRIES:-10}"
   export FIREWALL_APPLY_INTERVAL="${FIREWALL_APPLY_INTERVAL:-1}"
   export ENFORCE_SINGLE_FIREWALL="${ENFORCE_SINGLE_FIREWALL:-ufw}"
@@ -102,6 +102,12 @@ load_env() {
   export REMOTE_ONLY_REPAIR="${REMOTE_ONLY_REPAIR:-1}"
   export REMOTE_ONLY_REPAIR_CYCLES="${REMOTE_ONLY_REPAIR_CYCLES:-3}"
   export RESTORE_AUTO_REBOOT="${RESTORE_AUTO_REBOOT:-1}"
+
+  # Restauração automática de IP fixo local
+  export AUTO_RESTORE_FIXED_IP="${AUTO_RESTORE_FIXED_IP:-1}"
+  export FIXED_IP_RESTORE_MIN_INTERVAL="${FIXED_IP_RESTORE_MIN_INTERVAL:-900}"       # 15 min
+  export NETPLAN_RESTORE_REVERT_SECONDS="${NETPLAN_RESTORE_REVERT_SECONDS:-180}"     # 3 min
+  export INTERFACE_WATCH="${INTERFACE_WATCH:-}"  # vazio = usa interface do default route
 
   [[ -f "$ENV_FILE" ]] && source "$ENV_FILE" || true
 
@@ -342,10 +348,7 @@ firewalld_allow_ports() {
   done
   firewall-cmd --reload >/dev/null 2>&1 || true
 }
-
 firewall_allows_ports() {
-  # Mais tolerante: se UFW está ativo e permite, consideramos OK
-  # Caso contrário, verificamos outros firewalls apenas se eles estão ativos
   local ports="$*"
   local blocked=()
   local UFW_STATUS=""
@@ -357,6 +360,7 @@ firewall_allows_ports() {
       ufw)
         if command -v ufw >/dev/null 2>&1; then
           if grep -q '^Status: active' <<< "$UFW_STATUS"; then
+            local p
             for p in $ports; do
               awk -v port="${p}/tcp" '($1==port || $1==port" (v6)") && $2 ~ /^ALLOW/ {f=1} END{exit !f}' <<< "$UFW_STATUS" || blocked+=("$p")
             done
@@ -368,8 +372,8 @@ firewall_allows_ports() {
           local plist_rt plist_pm
           plist_rt="$(firewall-cmd --list-ports 2>/dev/null || true)"
           plist_pm="$(firewall-cmd --permanent --list-ports 2>/dev/null || true)"
+          local p
           for p in $ports; do
-            # se UFW já permite, dá ok
             if grep -q '^Status: active' <<< "$UFW_STATUS"; then
               awk -v port="${p}/tcp" '($1==port || $1==port" (v6)") && $2 ~ /^ALLOW/ {f=1} END{exit !f}' <<< "$UFW_STATUS" && continue
             fi
@@ -384,8 +388,8 @@ firewall_allows_ports() {
           has_input_hook=0; grep -q 'hook input' <<< "$rules" && has_input_hook=1
           policy="$(awk '$1=="chain" && $2=="input"{inchain=1} inchain && /policy/{print tolower($0); exit}' <<< "$rules")"
           if [[ $has_input_hook -eq 1 ]] && grep -Eq 'policy[[:space:]]+(drop|reject)' <<< "$policy"; then
+            local p
             for p in $ports; do
-              # UFW já permite? ok
               if grep -q '^Status: active' <<< "$UFW_STATUS"; then
                 awk -v port="${p}/tcp" '($1==port || $1==port" (v6)") && $2 ~ /^ALLOW/ {f=1} END{exit !f}' <<< "$UFW_STATUS" && continue
               fi
@@ -400,8 +404,8 @@ firewall_allows_ports() {
           save="$(iptables-save 2>/dev/null || true)"
           pol="$(iptables -L INPUT -n 2>/dev/null | sed -n 's/^Chain INPUT (policy \([A-Z]*\)).*/\1/p')"
           if [[ "$pol" == "DROP" || "$pol" == "REJECT" ]]; then
+            local p
             for p in $ports; do
-              # UFW já permite? ok
               if grep -q '^Status: active' <<< "$UFW_STATUS"; then
                 awk -v port="${p}/tcp" '($1==port || $1==port" (v6)") && $2 ~ /^ALLOW/ {f=1} END{exit !f}' <<< "$UFW_STATUS" && continue
               fi
@@ -419,7 +423,7 @@ firewall_allows_ports() {
   return 0
 }
 
-# salva-vidas multi-camada
+# salva-vidas multi-camada (evita lockout)
 salvage_open_ports() {
   local ports="$(echo $*)"
   # UFW
@@ -452,7 +456,7 @@ salvage_open_ports() {
 # GUARDA para evitar laços
 _ENSURE_PORTS_GUARD=0
 ensure_ports_open() {
-  load_env  # <<< evita "unbound variable" quando chamado cedo (ex.: safelane)
+  load_env  # evita "unbound variable" quando chamado cedo
   local ports="${*:-${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}}"
   ports="$(echo $ports)"
 
@@ -609,7 +613,6 @@ EOF
   log ERROR "sshd NÃO está escutando em ${PRIMARY_SSH_PORT}; verifique 'journalctl -u ssh' / 'journalctl -u sshd'"
   return 1
 }
-
 enforce_single_firewall() {
   load_env
   case "${ENFORCE_SINGLE_FIREWALL:-ufw}" in
@@ -628,7 +631,6 @@ enforce_single_firewall() {
     none) : ;;
   esac
 }
-
 install_self() {
   require_root
   load_env
@@ -708,6 +710,10 @@ SSH_PASSWORD_AUTH="no"
 RESTORE_AUTO_REBOOT=1
 REMOTE_ONLY_REPAIR=1
 REMOTE_ONLY_REPAIR_CYCLES=3
+AUTO_RESTORE_FIXED_IP=1
+FIXED_IP_RESTORE_MIN_INTERVAL=900
+NETPLAN_RESTORE_REVERT_SECONDS=180
+# INTERFACE_WATCH=""     # defina aqui se NÃO quiser usar a interface do default route
 EOF
   fi
 
@@ -752,7 +758,6 @@ UNIT
   say "Instalação concluída."
   say "Serviço iniciado."
 }
-
 uninstall_self() {
   require_root
   load_env
@@ -1069,7 +1074,7 @@ detect_external_vs_internal() {
   if has_outbound_internet; then
     local missing=""
     if ! missing=$(listening_on_ports $ports); then
-      : # 'missing' preenchido
+      : # missing preenchido
     else
       missing=""
     fi
@@ -1079,7 +1084,6 @@ detect_external_vs_internal() {
     elif [[ $rc -eq 2 ]]; then
       echo "degradado"; return 3
     else
-      # Sem acesso remoto: se há porta faltando => interno; caso contrário => externo
       if [[ -n "$missing" ]]; then echo "internal"; return 1; fi
       echo "external"; return 0
     fi
@@ -1092,6 +1096,125 @@ detect_external_vs_internal() {
     else
       echo "internal"; return 1
     fi
+  fi
+}
+
+# ------------- IP fixo: detecção & restauração (NOVO) -------------
+default_iface() { ip route | awk '/default/ {print $5; exit}'; }
+default_cidr() { local ifc="${1:-$(default_iface || true)}"; ip -o -4 addr show dev "$ifc" 2>/dev/null | awk '{print $4}' | head -n1; }
+
+record_default_ip_state() {
+  load_env
+  local ifc cidr
+  if [[ -n "$INTERFACE_WATCH" ]]; then
+    ifc="$INTERFACE_WATCH"
+  else
+    ifc="$(default_iface || true)"
+  fi
+  cidr="$(default_cidr "$ifc" || true)"
+  echo "${ifc:-none} ${cidr:-none}" > "$STATE_DIR/last_default_ip.txt"
+}
+default_ip_changed() {
+  load_env
+  local ifc_now cidr_now
+  if [[ -n "$INTERFACE_WATCH" ]]; then
+    ifc_now="$INTERFACE_WATCH"
+  else
+    ifc_now="$(default_iface || true)"
+  fi
+  cidr_now="$(default_cidr "$ifc_now" || true)"
+  if [[ ! -f "$STATE_DIR/last_default_ip.txt" ]]; then
+    echo "first-sample"
+    return 2
+  fi
+  local ifc_old cidr_old
+  read -r ifc_old cidr_old < "$STATE_DIR/last_default_ip.txt" || true
+  if [[ "$ifc_now" != "$ifc_old" || "$cidr_now" != "$cidr_old" ]]; then
+    echo "$ifc_old $cidr_old -> $ifc_now $cidr_now"
+    return 0
+  fi
+  return 1
+}
+find_latest_netcfg_snapshot() {
+  load_env
+  mapfile -t snaps < <(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d -printf "%P\n" | sort -r)
+  local s
+  for s in "${snaps[@]}"; do
+    [[ -d "$BACKUP_DIR/$s/files/etc/netplan" || -d "$BACKUP_DIR/$s/files/etc/NetworkManager" || -d "$BACKUP_DIR/$s/files/etc/network" ]] && {
+      echo "$BACKUP_DIR/$s"
+      return 0
+    }
+  done
+  if [[ -d "$BACKUP_DIR/000-initial/files/etc/netplan" || -d "$BACKUP_DIR/000-initial/files/etc/NetworkManager" || -d "$BACKUP_DIR/000-initial/files/etc/network" ]]; then
+    echo "$BACKUP_DIR/000-initial"
+    return 0
+  fi
+  return 1
+}
+restore_fixed_ip_from_backup() {
+  load_env
+  local snap
+  snap="$(find_latest_netcfg_snapshot)" || { log WARN "Nenhum snapshot com config de rede encontrado."; return 1; }
+
+  rm -rf "$STATE_DIR/netplan-rollback" || true
+  mkdir -p "$STATE_DIR/netplan-rollback"
+  rsync -a --delete /etc/netplan/ "$STATE_DIR/netplan-rollback/netplan/" 2>/dev/null || true
+  rsync -a --delete /etc/NetworkManager/ "$STATE_DIR/netplan-rollback/NetworkManager/" 2>/dev/null || true
+  rsync -a --delete /etc/network/ "$STATE_DIR/netplan-rollback/etc-network/" 2>/dev/null || true
+
+  salvage_open_ports "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
+  ssh_set_permissive_mode "restore-fixed-ip" || true
+
+  [[ -d "$snap/files/etc/netplan" ]] && rsync -a "$snap/files/etc/netplan/"/ /etc/netplan/ 2>/dev/null || true
+  [[ -d "$snap/files/etc/NetworkManager" ]] && rsync -a "$snap/files/etc/NetworkManager/"/ /etc/NetworkManager/ 2>/dev/null || true
+  [[ -d "$snap/files/etc/network" ]] && rsync -a "$snap/files/etc/network/"/ /etc/network/ 2>/dev/null || true
+
+  if command -v netplan >/dev/null 2>&1; then
+    netplan generate >/dev/null 2>&1 || true
+    netplan apply || true
+  fi
+  systemctl restart NetworkManager 2>/dev/null || true
+  systemctl restart networking 2>/dev/null || true
+  systemctl restart systemd-networkd 2>/dev/null || true
+
+  local guard="$DATA_DIR/netplan-revert.sh"
+  cat > "$guard" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+STATE_DIR="/opt/dogwatch/state"
+if [[ -d "$STATE_DIR/netplan-rollback" ]]; then
+  rsync -a "$STATE_DIR/netplan-rollback/netplan/"/ /etc/netplan/ 2>/dev/null || true
+  rsync -a "$STATE_DIR/netplan-rollback/NetworkManager/"/ /etc/NetworkManager/ 2>/dev/null || true
+  rsync -a "$STATE_DIR/netplan-rollback/etc-network/"/ /etc/network/ 2>/dev/null || true
+  if command -v netplan >/dev/null 2>&1; then
+    netplan generate >/dev/null 2>&1 || true
+    netplan apply || true
+  fi
+  systemctl restart NetworkManager 2>/dev/null || true
+  systemctl restart networking 2>/dev/null || true
+  systemctl restart systemd-networkd 2>/dev/null || true
+fi
+SH
+  chmod +x "$guard"
+
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --unit=dogwatch-netplan-revert --on-active="${NETPLAN_RESTORE_REVERT_SECONDS}s" "$guard" >/dev/null 2>&1 || true
+  else
+    nohup bash -c "sleep ${NETPLAN_RESTORE_REVERT_SECONDS}; \"$guard\"" >/dev/null 2>&1 &
+  fi
+
+  sleep 8
+  has_remote_access; local rc=$?
+  if [[ $rc -eq 0 || $rc -eq 2 ]]; then
+    systemctl stop dogwatch-netplan-revert.service >/dev/null 2>&1 || true
+    rm -rf "$STATE_DIR/netplan-rollback" || true
+    record_default_ip_state
+    log INFO "Restauração do IP fixo concluída com sucesso."
+    ssh_set_restricted_mode || true
+    return 0
+  else
+    log WARN "Restauração aplicada, mas o acesso público ainda falha. Se não for cancelado, rollback automático em ${NETPLAN_RESTORE_REVERT_SECONDS}s."
+    return 1
   fi
 }
 
@@ -1255,154 +1378,10 @@ diagnostics_summary() {
   esac
 }
 
-# ------------- Menu / Daemon -------------
-menu() {
-  require_root
-  load_env
-  while true; do
-    clear
-    status_report
-    echo
-    cat <<EOF
-================= DOGWATCH (v$VERSION) =================
-1) Status geral
-2) Ver logs (tail -f)
-3) Backup agora
-4) Listar backups
-5) Restaurar backup
-6) Portas - abrir/fechar/listar
-7) Firewalls - status/ativar/desativar
-8) Listas (UFW) - whitelist/blacklist
-9) Diagnósticos (ping/http/listen/firewall)
-10) Velocidade (speedtest-cli)
-11) Instalar/checar dependências
-12) Configurações (editar config.env)
-13) Remover solução (mantém backups)
-14) Aplicar baseline do servidor
-15) Fechar acesso emergencial (porta 22)
-0) Sair
-============================================================
-EOF
-    read -rp "Escolha: " op
-    case "$op" in
-      1)
-        echo "Status serviço:"
-        systemctl status "$PROG.service" --no-pager || true
-        echo
-        status_report
-        read -rp "Enter para continuar..." _ ;;
-      2)
-        echo "Pressione Ctrl+C para sair."
-        tail -f "$LOG_DIR/$PROG.log" || true ;;
-      3)
-        local path
-        path=$(backup_snapshot "manual")
-        echo "Backup criado em: $path"
-        read -rp "Enter para continuar..." _ ;;
-      4)
-        list_backups; read -rp "Enter para continuar..." _ ;;
-      5)
-        list_backups
-        read -rp "Digite o nome do snapshot para restaurar: " s
-        restore_snapshot "$s"
-        echo "Restauração solicitada."
-        read -rp "Enter para continuar..." _ ;;
-      6)
-        echo "Portas obrigatórias atuais: $MANDATORY_OPEN_PORTS"
-        echo "Portas extras: $EXTRA_PORTS"
-        echo "a) Abrir porta"
-        echo "b) Fechar porta (apenas extras)"
-        echo "c) Listar listening (ss) e UFW"
-        read -rp "Opção: " po
-        case "$po" in
-          a)
-            read -rp "Porta TCP a abrir: " p
-            if [[ -n "${p//[^0-9]/}" ]]; then
-              grep -q '^EXTRA_PORTS=' "$ENV_FILE" || echo 'EXTRA_PORTS=""' >> "$ENV_FILE"
-              EXTRA_PORTS="$(echo "$EXTRA_PORTS $p" | xargs -n1 | sort -u | xargs)"
-              sed -i "s/^EXTRA_PORTS=.*/EXTRA_PORTS=\"$EXTRA_PORTS\"/" "$ENV_FILE"
-              grep -q '^MANUAL_OVERRIDE_PORTS=' "$ENV_FILE" || echo 'MANUAL_OVERRIDE_PORTS=0' >> "$ENV_FILE"
-              MANUAL_OVERRIDE_PORTS=1; sed -i "s/^MANUAL_OVERRIDE_PORTS=.*/MANUAL_OVERRIDE_PORTS=1/" "$ENV_FILE"
-              ensure_ports_open
-              echo "Porta $p adicionada e aberta."
-            fi ;;
-          b)
-            read -rp "Porta TCP a fechar (somente se estiver em EXTRA_PORTS): " p
-            if echo " $EXTRA_PORTS " | grep -q " $p "; then
-              EXTRA_PORTS="$(echo "$EXTRA_PORTS" | tr ' ' '\n' | grep -v "^$p$" | xargs)"
-              sed -i "s/^EXTRA_PORTS=.*/EXTRA_PORTS=\"$EXTRA_PORTS\"/" "$ENV_FILE"
-              if command -v ufw >/dev/null 2>&1; then
-                LC_ALL=C LANG=C ufw delete allow "$p/tcp" || true
-              fi
-              echo "Porta $p removida de EXTRA_PORTS e (se UFW presente) bloqueada."
-            else
-              echo "Porta não está em EXTRA_PORTS."
-            fi ;;
-          c)
-            ss -lntup || true
-            echo
-            if command -v ufw >/dev/null 2>&1; then
-              LC_ALL=C LANG=C ufw status verbose 2>/dev/null || true
-            else
-              echo "UFW: não instalado"
-            fi ;;
-        esac
-        read -rp "Enter para continuar..." _ ;;
-      7)
-        echo "Firewalls:"
-        echo "- UFW: $(systemctl is-enabled ufw 2>/dev/null || true) / $(systemctl is-active ufw 2>/dev/null || true)"
-        echo "- firewalld: $(systemctl is-enabled firewalld 2>/dev/null || true) / $(systemctl is-active firewalld 2>/dev/null || true)"
-        echo "a) Ativar UFW"
-        echo "b) Desativar UFW"
-        echo "c) Parar e desabilitar firewalld"
-        read -rp "Opção: " fo
-        case "$fo" in
-          a) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw --force enable; ensure_ports_open; echo "UFW ativado."; else echo "UFW não instalado."; fi ;;
-          b) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw --force disable; echo "UFW desativado."; else echo "UFW não instalado."; fi ;;
-          c) systemctl stop firewalld || true; systemctl disable firewalld || true; systemctl mask firewalld || true; echo "firewalld desativado." ;;
-        esac
-        read -rp "Enter para continuar..." _ ;;
-      8)
-        echo "Listas UFW:"
-        echo "a) Adicionar IP à whitelist (allow)"
-        echo "b) Adicionar IP à blacklist (deny)"
-        echo "c) Remover regra por número"
-        echo "d) Listar regras numeradas"
-        read -rp "Opção: " lo
-        case "$lo" in
-          a) read -rp "IP/CIDR para permitir: " ip; if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw allow from "$ip" || true; else echo "UFW não instalado."; fi ;;
-          b) read -rp "IP/CIDR para negar: " ip; if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw deny from "$ip" || true; else echo "UFW não instalado."; fi ;;
-          c) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw status numbered; read -rp "Número da regra para deletar: " n; yes | LC_ALL=C LANG=C ufw delete "$n" || true; else echo "UFW não instalado."; fi ;;
-          d) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw status numbered || true; else echo "UFW não instalado."; fi ;;
-        esac
-        read -rp "Enter para continuar..." _ ;;
-      9)
-        diagnostics_summary
-        read -rp "Enter para continuar..." _ ;;
-      10)
-        command -v speedtest >/dev/null 2>&1 && speedtest || speedtest-cli || true
-        read -rp "Enter para continuar..." _ ;;
-      11)
-        install_self ;;
-      12)
-        ${EDITOR:-nano} "$ENV_FILE" ;;
-      13)
-        uninstall_self ;;
-      14)
-        apply_server_baseline; read -rp "Enter para continuar..." _ ;;
-      15)
-        ssh_set_restricted_mode; echo "Acesso emergencial fechado."; read -rp "Enter para continuar..." _ ;;
-      0) exit 0 ;;
-      *) echo "Opção inválida"; sleep 1 ;;
-    esac
-  done
-}
-
 # ------------- Baseline (opcional) -------------
 apply_server_baseline() {
   load_env
   log INFO "Aplicando baseline do servidor"
-  # (somente aplica rede estática se explicitamente habilitado externamente)
   log INFO "Baseline de rede está OFF (não forçada por padrão)."
 
   ssh_set_dual_port_mode || return 1
@@ -1457,9 +1436,11 @@ daemon_loop() {
   fi
   ssh_check_ttl_and_restrict_if_needed
 
+  # grava estado inicial de IP/CIDR se ainda não existir
+  [[ -f "$STATE_DIR/last_default_ip.txt" ]] || record_default_ip_state
+
   local last_backup_ts=0
   while true; do
-    # checagens recorrentes
     enforce_single_firewall || true
     ssh_check_ttl_and_restrict_if_needed
 
@@ -1478,6 +1459,7 @@ daemon_loop() {
       normal)
         streak=$((streak + 1))
         echo "$streak" > "$STATE_DIR/normal_streak"
+        record_default_ip_state   # mantém baseline de IP/CIDR
         local current_hash last_hash
         current_hash="$(compute_current_hash || echo x)"
         last_hash="$(cat "$STATE_DIR/last_good.hash" 2>/dev/null || echo y)"
@@ -1489,7 +1471,25 @@ daemon_loop() {
       external)
         echo 0 > "$STATE_DIR/normal_streak"
         log WARN "Conectividade classificada como EXTERNAL (sem evidência de falha interna). Nenhuma ação destrutiva."
-        # Estratégia de reparo remoto opcional (abre janela emergencial se só o acesso público falhar por alguns ciclos)
+
+        # Restauração automática do IP fixo local, caso tenha mudado
+        if [[ "${AUTO_RESTORE_FIXED_IP:-1}" == "1" ]]; then
+          if default_ip_changed >/dev/null 2>&1; then
+            local last_ts nowts
+            last_ts="$(cat "$STATE_DIR/last_fixed_ip_restore_ts" 2>/dev/null || echo 0)"
+            nowts="$(date +%s)"
+            if (( nowts - last_ts >= ${FIXED_IP_RESTORE_MIN_INTERVAL:-900} )); then
+              log WARN "Mudança do IP/CIDR local detectada durante falha pública; tentando restaurar IP fixo do snapshot."
+              if restore_fixed_ip_from_backup; then
+                echo "$nowts" > "$STATE_DIR/last_fixed_ip_restore_ts"
+              fi
+            else
+              log INFO "Mudança de IP local detectada, mas em cooldown; ignorando por enquanto."
+            fi
+          fi
+        fi
+
+        # Reparo leve para falha apenas pública
         if [[ "${REMOTE_ONLY_REPAIR:-1}" == "1" ]]; then
           local pf="$STATE_DIR/public_fail_streak"
           local pfs; pfs="$(cat "$pf" 2>/dev/null || echo 0)"; pfs=$((pfs+1)); echo "$pfs" > "$pf"
@@ -1535,7 +1535,147 @@ case "${1:-}" in
   ensure-ports) ensure_ports_open ;;
   status) status_report ;;
   repair-now) ensure_ports_open; detect_external_vs_internal >/dev/null || true; attempt_restore_queue || true ;;
-  "") menu ;;
+  "") menu() {
+        require_root
+        load_env
+        while true; do
+          clear
+          status_report
+          echo
+          cat <<EOF
+================= DOGWATCH (v$VERSION) =================
+1) Status geral
+2) Ver logs (tail -f)
+3) Backup agora
+4) Listar backups
+5) Restaurar backup
+6) Portas - abrir/fechar/listar
+7) Firewalls - status/ativar/desativar
+8) Listas (UFW) - whitelist/blacklist
+9) Diagnósticos (ping/http/listen/firewall)
+10) Velocidade (speedtest-cli)
+11) Instalar/checar dependências
+12) Configurações (editar config.env)
+13) Remover solução (mantém backups)
+14) Aplicar baseline do servidor
+15) Fechar acesso emergencial (porta 22)
+0) Sair
+============================================================
+EOF
+          read -rp "Escolha: " op
+          case "$op" in
+            1)
+              echo "Status serviço:"
+              systemctl status "$PROG.service" --no-pager || true
+              echo
+              status_report
+              read -rp "Enter para continuar..." _ ;;
+            2)
+              echo "Pressione Ctrl+C para sair."
+              tail -f "$LOG_DIR/$PROG.log" || true ;;
+            3)
+              local path
+              path=$(backup_snapshot "manual")
+              echo "Backup criado em: $path"
+              read -rp "Enter para continuar..." _ ;;
+            4)
+              list_backups; read -rp "Enter para continuar..." _ ;;
+            5)
+              list_backups
+              read -rp "Digite o nome do snapshot para restaurar: " s
+              restore_snapshot "$s"
+              echo "Restauração solicitada."
+              read -rp "Enter para continuar..." _ ;;
+            6)
+              echo "Portas obrigatórias atuais: $MANDATORY_OPEN_PORTS"
+              echo "Portas extras: $EXTRA_PORTS"
+              echo "a) Abrir porta"
+              echo "b) Fechar porta (apenas extras)"
+              echo "c) Listar listening (ss) e UFW"
+              read -rp "Opção: " po
+              case "$po" in
+                a)
+                  read -rp "Porta TCP a abrir: " p
+                  if [[ -n "${p//[^0-9]/}" ]]; then
+                    grep -q '^EXTRA_PORTS=' "$ENV_FILE" || echo 'EXTRA_PORTS=""' >> "$ENV_FILE"
+                    EXTRA_PORTS="$(echo "$EXTRA_PORTS $p" | xargs -n1 | sort -u | xargs)"
+                    sed -i "s/^EXTRA_PORTS=.*/EXTRA_PORTS=\"$EXTRA_PORTS\"/" "$ENV_FILE"
+                    grep -q '^MANUAL_OVERRIDE_PORTS=' "$ENV_FILE" || echo 'MANUAL_OVERRIDE_PORTS=0' >> "$ENV_FILE"
+                    MANUAL_OVERRIDE_PORTS=1; sed -i "s/^MANUAL_OVERRIDE_PORTS=.*/MANUAL_OVERRIDE_PORTS=1/" "$ENV_FILE"
+                    ensure_ports_open
+                    echo "Porta $p adicionada e aberto no firewall."
+                  fi ;;
+                b)
+                  read -rp "Porta TCP a fechar (somente se estiver em EXTRA_PORTS): " p
+                  if echo " $EXTRA_PORTS " | grep -q " $p "; then
+                    EXTRA_PORTS="$(echo "$EXTRA_PORTS" | tr ' ' '\n' | grep -v "^$p$" | xargs)"
+                    sed -i "s/^EXTRA_PORTS=.*/EXTRA_PORTS=\"$EXTRA_PORTS\"/" "$ENV_FILE"
+                    if command -v ufw >/dev/null 2>&1; then
+                      LC_ALL=C LANG=C ufw delete allow "$p/tcp" || true
+                    fi
+                    echo "Porta $p removida de EXTRA_PORTS e (se UFW presente) bloqueada."
+                  else
+                    echo "Porta não está em EXTRA_PORTS."
+                  fi ;;
+                c)
+                  ss -lntup || true
+                  echo
+                  if command -v ufw >/dev/null 2>&1; then
+                    LC_ALL=C LANG=C ufw status verbose 2>/dev/null || true
+                  else
+                    echo "UFW: não instalado"
+                  fi ;;
+              esac
+              read -rp "Enter para continuar..." _ ;;
+            7)
+              echo "Firewalls:"
+              echo "- UFW: $(systemctl is-enabled ufw 2>/dev/null || true) / $(systemctl is-active ufw 2>/dev/null || true)"
+              echo "- firewalld: $(systemctl is-enabled firewalld 2>/dev/null || true) / $(systemctl is-active firewalld 2>/dev/null || true)"
+              echo "a) Ativar UFW"
+              echo "b) Desativar UFW"
+              echo "c) Parar e desabilitar firewalld"
+              read -rp "Opção: " fo
+              case "$fo" in
+                a) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw --force enable; ensure_ports_open; echo "UFW ativado."; else echo "UFW não instalado."; fi ;;
+                b) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw --force disable; echo "UFW desativado."; else echo "UFW não instalado."; fi ;;
+                c) systemctl stop firewalld || true; systemctl disable firewalld || true; systemctl mask firewalld || true; echo "firewalld desativado." ;;
+              esac
+              read -rp "Enter para continuar..." _ ;;
+            8)
+              echo "Listas UFW:"
+              echo "a) Adicionar IP à whitelist (allow)"
+              echo "b) Adicionar IP à blacklist (deny)"
+              echo "c) Remover regra por número"
+              echo "d) Listar regras numeradas"
+              read -rp "Opção: " lo
+              case "$lo" in
+                a) read -rp "IP/CIDR para permitir: " ip; if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw allow from "$ip" || true; else echo "UFW não instalado."; fi ;;
+                b) read -rp "IP/CIDR para negar: " ip; if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw deny from "$ip" || true; else echo "UFW não instalado."; fi ;;
+                c) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw status numbered; read -rp "Número da regra para deletar: " n; yes | LC_ALL=C LANG=C ufw delete "$n" || true; else echo "UFW não instalado."; fi ;;
+                d) if command -v ufw >/dev/null 2>&1; then LC_ALL=C LANG=C ufw status numbered || true; else echo "UFW não instalado."; fi ;;
+              esac
+              read -rp "Enter para continuar..." _ ;;
+            9)
+              diagnostics_summary
+              read -rp "Enter para continuar..." _ ;;
+            10)
+              command -v speedtest >/dev/null 2>&1 && speedtest || speedtest-cli || true
+              read -rp "Enter para continuar..." _ ;;
+            11)
+              install_self ;;
+            12)
+              ${EDITOR:-nano} "$ENV_FILE" ;;
+            13)
+              uninstall_self ;;
+            14)
+              apply_server_baseline; read -rp "Enter para continuar..." _ ;;
+            15)
+              ssh_set_restricted_mode; echo "Acesso emergencial fechado."; read -rp "Enter para continuar..." _ ;;
+            0) exit 0 ;;
+            *) echo "Opção inválida"; sleep 1 ;;
+          esac
+        done
+      }; menu ;;
   *)
     cat <<EOF
 $PROG v$VERSION
