@@ -443,7 +443,7 @@ restore_snapshot() {
   log INFO "Restaurando snapshot: $snap"
 
   # Desabilita firewalls antes de restaurar
-  safe_disable_firewalls()
+  safe_disable_firewalls
 
   # Restaura arquivos preservando paths completos
   rsync -a "$dir/files"/ / 2>/dev/null || true
