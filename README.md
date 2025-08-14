@@ -13,14 +13,13 @@ sudo apt-get update -y && sudo apt-get install -y git
 git clone https://github.com/aryabdo/DogWatch.git
 cd DogWatch
 sudo ./install.sh
-sudo systemctl enable --now dogwatch.service
+# O instalador já habilita os serviços dogwatch e dogwatch-safelane
 ```
 
 ## Instalação (one-liner via `curl`)
-> Substitua `<seu-usuario>` e `<dogwatch>` pelo nome do seu repositório público no GitHub.
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aryabdo/DogWatch/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/aryabdo/DogWatch/main/install.sh | \
+  sudo REPO_URL=https://github.com/aryabdo/DogWatch.git bash
 ```
 
 ## Atualização
@@ -46,7 +45,8 @@ sudo /opt/dogwatch/dogwatch.sh uninstall
 
 ## Componentes
 - `dogwatch.sh` — Daemon + CLI/menu.
-- `dogwatch.service` — Serviço systemd (inicia no boot; reinicia se cair).
+- `dogwatch.service` — Serviço systemd principal (inicia no boot; reinicia se cair).
+- `dogwatch-safelane.service` — Serviço systemd que abre portas essenciais antes da rede (gerado pelo install.sh).
 - `config.env.example` — Exemplo copiado para `/etc/dogwatch/config.env` na instalação; ajuste depois conforme necessário.
 - `install.sh` — Instalador que pode instalar a partir deste repositório ou via one-liner.
 - `Makefile` — Atalhos (install/uninstall/menu/status/logs/pkg).
@@ -63,7 +63,7 @@ Logs: `/var/log/dogwatch/dogwatch.log`
   - **internal** (mudança local): **restauração automática** do snapshot mais novo → mais antigo (inclui 0.0), validando conexão após cada passo.
   - **degradado** (fallback para IP local; possível hairpin NAT): **restauração automática**.
 - **Verifica acesso remoto** ao IP público e reverte para backups caso falhe, mesmo com internet disponível.
-- **Garante portas**: `22` (obrigatória) e abre `16309` (opcional); detecta firewalls instalados e abre portas necessárias automaticamente.
+- **Garante portas**: `16309` (primária) e `22` (emergência); detecta firewalls instalados e abre portas necessárias automaticamente.
 - **Fila de restauração persistente** testa snapshots do mais novo ao mais antigo a cada reboot e pode desativar o serviço automaticamente com `STOP_SERVICE_ON_SUCCESS=1` após sucesso.
 - **Recuperação SSH**: habilita login por senha de qualquer IP, limpa blacklists e desbloqueia usuários para restabelecer acesso.
 - **Menu interativo**: execute `dogwatch.sh` sem argumentos para backups, restauração, portas, firewalls, listas (UFW), diagnósticos, speedtest, editar config, etc.

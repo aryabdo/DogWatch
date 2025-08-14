@@ -8,14 +8,14 @@ uninstall:
 	sudo /opt/dogwatch/dogwatch.sh uninstall || true
 
 enable:
-	sudo systemctl enable --now dogwatch.service
+	sudo systemctl enable --now dogwatch.service dogwatch-safelane.service
 
 disable:
-	sudo systemctl disable --now dogwatch.service || true
-	sudo systemctl stop dogwatch.service || true
+	sudo systemctl disable --now dogwatch.service dogwatch-safelane.service || true
+	sudo systemctl stop dogwatch.service dogwatch-safelane.service || true
 
 status:
-	systemctl status dogwatch.service --no-pager || true
+	systemctl status --no-pager dogwatch.service dogwatch-safelane.service || true
 	sudo /opt/dogwatch/dogwatch.sh status || true
 
 logs:

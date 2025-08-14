@@ -1,13 +1,14 @@
 [Unit]
 Description=DogWatch daemon
+After=network-online.target
 Wants=network-online.target
-After=network-online.target ssh.service
 
 [Service]
 Type=simple
 ExecStart=/opt/dogwatch/dogwatch.sh daemon
 Restart=always
-RestartSec=5
+RestartSec=3
+User=root
 
 [Install]
 WantedBy=multi-user.target
