@@ -14,7 +14,10 @@ require_root() {
   fi
 }
 
-# --- UFW helpers ---
+apt_quiet_install() {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >/dev/null 2>&1 || true
+}
+
 ufw_disable_safely() {
   if have_cmd ufw; then
     say "Desativando UFW temporariamente..."
@@ -37,15 +40,11 @@ read_ports_from_env() {
 
 ufw_enable_with_ports() {
   read_ports_from_env
-
-  # garante pacote
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ufw >/dev/null 2>&1 || true
+  apt_quiet_install ufw
   hash -r
 
   if have_cmd ufw; then
     say "Reativando UFW e garantindo portas essenciais..."
-
-    # força backend nftables e desliga logging
     mkdir -p /etc/ufw
     if [[ -f /etc/ufw/ufw.conf ]]; then
       grep -q '^BACKEND=' /etc/ufw/ufw.conf \
@@ -57,29 +56,17 @@ ufw_enable_with_ports() {
     else
       printf '%s\n' 'ENABLED=no' 'LOGLEVEL=off' 'BACKEND=nftables' > /etc/ufw/ufw.conf || true
     fi
-    # (opcional) evita ruído do logging IPv6 em alguns ambientes
-    if [[ -f /etc/default/ufw ]]; then
-      sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || true
-    fi
+    [[ -f /etc/default/ufw ]] && sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw || true
 
-    # zera regras e define políticas
     LC_ALL=C LANG=C ufw --force reset >/dev/null 2>&1 || true
     LC_ALL=C LANG=C ufw logging off >/dev/null 2>&1 || true
     LC_ALL=C LANG=C ufw default deny incoming >/dev/null 2>&1 || true
     LC_ALL=C LANG=C ufw default allow outgoing >/dev/null 2>&1 || true
 
-    # abre portas
     LC_ALL=C LANG=C ufw allow "${PRIMARY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
     LC_ALL=C LANG=C ufw allow "${EMERGENCY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
 
-    # habilita; suprime apenas o ruído de logging
     LC_ALL=C LANG=C ufw --force enable >/dev/null 2>&1 || true
-
-    # checagem de sanidade
-    if ! systemctl is-active --quiet ufw 2>/dev/null; then
-      say "Aviso: UFW não ficou ativo; tentando habilitar novamente."
-      LC_ALL=C LANG=C ufw --force enable >/dev/null 2>&1 || true
-    fi
     LC_ALL=C LANG=C ufw status verbose || true
   else
     say "Aviso: UFW não está disponível; prosseguindo sem UFW."
@@ -104,57 +91,91 @@ check_listen_port() {
 }
 
 install_from_here_or_clone() {
-  if [[ -f "./dogwatch.sh" && -f "./dogwatch.service" ]]; then
+  # Se o dogwatch.sh está neste diretório, usa local; senão, clona o repositório
+  if [[ -f "./dogwatch.sh" ]]; then
     say "Instalando a partir do diretório atual..."
     bash ./dogwatch.sh install
   else
-    say "Executando em modo one-liner; clonando o repositório..."
+    say "Clonando o repositório..."
     local tmpdir
     tmpdir="$(mktemp -d)"
+    apt_quiet_install git
     git clone "$REPO_URL" "$tmpdir"
     cd "$tmpdir"
     bash ./dogwatch.sh install
   fi
 }
 
+write_safelane_unit() {
+  # Unit que garante 'ensure-ports' ANTES da rede subir
+  cat >/etc/systemd/system/dogwatch-safelane.service <<'UNIT'
+[Unit]
+Description=DogWatch Early Safelane (abre portas críticas antes da rede)
+Documentation=man:systemd.unit(5)
+After=local-fs.target
+RequiresMountsFor=/opt/dogwatch
+ConditionFileIsExecutable=/opt/dogwatch/dogwatch.sh
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+# pequeno atraso para UFW/firewalld/nft inicializarem
+ExecStartPre=/bin/sleep 3
+# 'ensure-ports' chama load_env internamente (sem "unbound variable")
+ExecStart=/bin/bash -lc '/opt/dogwatch/dogwatch.sh ensure-ports || true'
+RemainAfterExit=yes
+SuccessExitStatus=0 1 2
+
+[Install]
+WantedBy=network-pre.target
+UNIT
+  chmod 0644 /etc/systemd/system/dogwatch-safelane.service
+}
+
 main() {
   require_root
 
-  # pré-requisitos básicos
-  apt-get update -y || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates || true
+  # Pré-requisitos
+  apt-get update -y >/dev/null 2>&1 || true
+  apt_quiet_install curl ca-certificates iproute2 netcat-openbsd jq rsync openssh-server nftables iptables
 
-  # desativa UFW no começo
+  # (opcional) segurar firewalld para evitar conflitos
+  if command -v apt-mark >/dev/null 2>&1; then apt-mark hold firewalld >/dev/null 2>&1 || true; fi
+
+  # Desativa UFW no começo para não atrapalhar a instalação
   ufw_disable_safely
 
-  # instala DogWatch (do diretório ou do repo)
-  say "Instalando a partir do diretório atual..."
-  say "Instalando dependências..."
+  # Instala o DogWatch (cria /opt/dogwatch/dogwatch.sh e o serviço principal)
   install_from_here_or_clone
 
-  # garante unit file e serviço
-  if [[ -f "./dogwatch.service" ]]; then
-    install -m 0644 ./dogwatch.service /etc/systemd/system/dogwatch.service
-  fi
+  # Garante que o serviço principal esteja enable/now
   systemctl daemon-reload
   systemctl enable --now dogwatch.service || true
 
-  # reativa UFW + portas
+  # Cria e ativa o SAFELANE (instalado pelo install.sh)
+  write_safelane_unit
+  systemctl daemon-reload
+  systemctl enable --now dogwatch-safelane.service || true
+
+  # Reativa UFW e libera as portas essenciais
   ufw_enable_with_ports
 
-  # garante portas também via DogWatch (independe de UFW)
+  # Reforça as portas também via DogWatch (independe de UFW)
   if [[ -x /opt/dogwatch/dogwatch.sh ]]; then
-    /opt/dogwatch/dogwatch.sh ensure-ports >/dev/null 2>&1 || true
+    /bin/bash -lc '/opt/dogwatch/dogwatch.sh ensure-ports || true'
   fi
 
-  # reinicia ssh e confere
+  # Reinicia SSH e confere
   systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
   read_ports_from_env
   check_listen_port "$PRIMARY_SSH_PORT"
 
   say "Instalação concluída. Binário: /opt/dogwatch/dogwatch.sh"
-  say "Status do serviço:"
+  say "Status do serviço principal:"
   systemctl status dogwatch --no-pager || true
+  say "Status do safelane:"
+  systemctl status dogwatch-safelane --no-pager || true
 }
 
 main "$@"
