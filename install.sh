@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Instalador do DogWatch para uso via GitHub (git clone) OU via one-liner (curl)
-# - Se executado dentro do diretório do repositório (arquivos presentes), instala direto.
-# - Se executado "solo" (via curl), clona o repo para /tmp e instala a partir de lá.
+# Instalador do DogWatch (repo local ou one-liner)
+# - Se arquivos estiverem no diretório atual, instala a partir dele.
+# - Caso contrário, clona REPO_URL (branch BRANCH) em /tmp e instala.
 
 REPO_URL_DEFAULT="https://github.com/<seu-usuario>/<dogwatch>.git"
 REPO_URL="${REPO_URL:-$REPO_URL_DEFAULT}"
+BRANCH="${BRANCH:-main}"
+
+export DEBIAN_FRONTEND=noninteractive
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -15,38 +18,70 @@ require_root() {
   fi
 }
 
+have_file() { [[ -f "$1" ]]; }
+
+install_prereqs() {
+  apt-get update -y || true
+  apt-get install -y --no-install-recommends git curl ca-certificates || true
+}
+
+run_core_install() {
+  bash ./dogwatch.sh install
+}
+
+enable_service_if_needed() {
+  # Se o serviço já foi instalado e habilitado pelo dogwatch.sh, não repita.
+  if systemctl list-unit-files | grep -q '^dogwatch\.service'; then
+    systemctl daemon-reload || true
+    systemctl enable --now dogwatch.service || true
+  fi
+}
+
+post_checks() {
+  # Abre portas (idempotente) e checa SSH
+  /opt/dogwatch/dogwatch.sh ensure-ports >/dev/null 2>&1 || true
+  systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
+
+  # Verificação final de conectividade na porta padrão (16309 por default)
+  local port="${PRIMARY_SSH_PORT:-16309}"
+  if command -v nc >/dev/null 2>&1; then
+    if ! nc -w2 -z 127.0.0.1 "$port" >/dev/null 2>&1 && ! nc -w2 -z ::1 "$port" >/dev/null 2>&1; then
+      echo "[dogwatch] Aviso: porta $port não detectada como aberta localmente" >&2
+    fi
+  fi
+
+  # Relatório final do próprio DogWatch
+  /opt/dogwatch/dogwatch.sh status || true
+}
+
 main() {
   require_root
+
   local virt
   virt="$(systemd-detect-virt 2>/dev/null || echo unknown)"
   if [[ "$virt" != "none" ]]; then
     echo "[dogwatch] Aviso: ambiente virtual detectado ($virt); prosseguindo com a instalação..."
   fi
-  apt-get update -y || true
-  DEBIAN_FRONTEND=noninteractive apt-get install -y git curl ca-certificates || true
 
-  if [[ -f "./dogwatch.sh" && -f "./dogwatch.service" ]]; then
+  install_prereqs
+
+  if have_file "./dogwatch.sh" && have_file "./dogwatch.service"; then
     echo "[dogwatch] Instalando a partir do diretório atual..."
-    bash ./dogwatch.sh install
+    run_core_install
   else
-    echo "[dogwatch] Executando em modo one-liner; clonando o repositório..."
+    echo "[dogwatch] One-liner: clonando o repositório ($REPO_URL @ $BRANCH)..."
     tmpdir="$(mktemp -d)"
-    git clone "$REPO_URL" "$tmpdir"
+    git clone --branch "$BRANCH" --depth 1 "$REPO_URL" "$tmpdir"
     cd "$tmpdir"
-    bash ./dogwatch.sh install
+    run_core_install
   fi
 
-  install -m 0644 ./dogwatch.service /etc/systemd/system/dogwatch.service
-  systemctl daemon-reload
-  systemctl enable --now dogwatch.service
+  # dogwatch.sh install já copia o .service e habilita; apenas garanta o enable/daemon-reload
+  enable_service_if_needed
 
-  /opt/dogwatch/dogwatch.sh ensure-ports >/dev/null 2>&1 || true
-  systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
-  if command -v ss >/dev/null 2>&1; then
-    ss -H -ltn 2>/dev/null | awk -v p=16309 '{gsub(/\[|\]/,"",$4); n=split($4,a,":"); if (a[n]==p){found=1; exit}} END {exit !found}' || \
-      echo "[dogwatch] Aviso: porta 16309 não detectada como aberta" >&2
-  fi
-  echo "[dogwatch] Instalação concluída. Use: /opt/dogwatch/dogwatch.sh"
+  post_checks
+
+  echo "[dogwatch] Instalação concluída. Binário: /opt/dogwatch/dogwatch.sh"
 }
 
 main "$@"
