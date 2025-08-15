@@ -1,4 +1,4 @@
-DogWatch (v1.2.8)
+# DogWatch (v1.2.8)
 
 DogWatch é um daemon em Bash para evitar lockout de SSH, manter portas críticas abertas, fazer backups/instantâneos de configuração e tentar autorreparo de rede/firewall/SSH em servidores Linux com systemd.
 
