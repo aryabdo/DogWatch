@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ================= DogWatch Installer (compatível com a nova versão) =================
+
 REPO_URL_DEFAULT="https://github.com/<seu-usuario>/<dogwatch>.git"
 REPO_URL="${REPO_URL:-$REPO_URL_DEFAULT}"
 
-say() { echo "[dogwatch] $*"; }
+say() { echo "[dogwatch-install] $*"; }
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 require_root() {
@@ -30,6 +32,14 @@ read_ports_from_env() {
     EMERGENCY_SSH_PORT="${EMERGENCY_SSH_PORT:-22}"
   fi
   export PRIMARY_SSH_PORT EMERGENCY_SSH_PORT
+}
+
+# --- Netplan: corrigir permissões para evitar WARNING ---
+fix_netplan_perms() {
+  local fn="/etc/netplan/90-dogwatch-static.yaml"
+  if [[ -f "$fn" ]]; then
+    chmod 0600 "$fn" 2>/dev/null || true
+  fi
 }
 
 # --- UFW helpers ---
@@ -65,6 +75,7 @@ ufw_enable_with_ports() {
     LC_ALL=C LANG=C ufw default deny incoming >/dev/null 2>&1 || true
     LC_ALL=C LANG=C ufw default allow outgoing >/dev/null 2>&1 || true
 
+    # Abrimos as portas principais para evitar lockout durante/apos a instalação
     LC_ALL=C LANG=C ufw allow "${PRIMARY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
     LC_ALL=C LANG=C ufw allow "${EMERGENCY_SSH_PORT}/tcp" >/dev/null 2>&1 || true
 
@@ -103,9 +114,12 @@ install_from_here_or_clone() {
     local tmpdir
     tmpdir="$(mktemp -d)"
     apt_quiet_install git
-    git clone "$REPO_URL" "$tmpdir"
-    cd "$tmpdir"
-    bash ./dogwatch.sh install
+    if git clone "$REPO_URL" "$tmpdir" >/dev/null 2>&1; then
+      cd "$tmpdir"
+      bash ./dogwatch.sh install
+    else
+      say "Falha ao clonar $REPO_URL"; exit 2
+    fi
   fi
 }
 
@@ -139,12 +153,15 @@ UNIT
 main() {
   require_root
 
-  # Pré-requisitos
+  # Pré-requisitos (inclui ferramentas usadas pela nova versão do dogwatch.sh)
   apt-get update -y >/dev/null 2>&1 || true
-  apt_quiet_install curl ca-certificates iproute2 netcat-openbsd jq rsync openssh-server nftables iptables ufw git
+  apt_quiet_install curl ca-certificates iproute2 netcat-openbsd jq rsync \
+                    openssh-server nftables iptables ufw git netplan.io
 
-  # (opcional) segurar firewalld para evitar conflitos
-  if command -v apt-mark >/dev/null 2>&1; then apt-mark hold firewalld >/dev/null 2>&1 || true; fi
+  # Evitar conflitos com firewalld (a nova versão privilegia UFW por padrão)
+  if command -v apt-mark >/dev/null 2>&1; then
+    apt-mark hold firewalld >/dev/null 2>&1 || true
+  fi
 
   # Desativa UFW no começo para não atrapalhar a instalação
   ufw_disable_safely
@@ -156,10 +173,13 @@ main() {
   systemctl daemon-reload
   systemctl enable --now dogwatch.service || true
 
-  # Cria e ativa o SAFELANE (instalado pelo install.sh)
+  # Cria e ativa o SAFELANE (executa ensure-ports antes da rede)
   write_safelane_unit
   systemctl daemon-reload
   systemctl enable --now dogwatch-safelane.service || true
+
+  # Ajusta permissões de netplan pra evitar WARNING
+  fix_netplan_perms
 
   # Reativa UFW e libera as portas essenciais
   ufw_enable_with_ports
@@ -169,10 +189,11 @@ main() {
     /bin/bash -lc '/opt/dogwatch/dogwatch.sh ensure-ports || true'
   fi
 
-  # Reinicia SSH e confere
+  # Reinicia SSH e confere (ambos nomes de serviço)
   systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
   read_ports_from_env
   check_listen_port "$PRIMARY_SSH_PORT"
+  check_listen_port "$EMERGENCY_SSH_PORT" || true
 
   say "Instalação concluída. Binário: /opt/dogwatch/dogwatch.sh"
   say "Status do serviço principal:"
