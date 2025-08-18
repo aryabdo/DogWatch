@@ -24,7 +24,9 @@ Destaques
 
 🧰 Menu interativo com operações comuns (status, logs ao vivo, backup/restore, portas, UFW, etc).
 
-🐳 Gerenciamento opcional de Docker e containers (instalar/desinstalar, editar config e docker-compose).
+🐳 Gerenciamento opcional de Docker e containers (instalar/desinstalar, editar config e docker-compose) sem monitorar ou alterar regras do Docker.
+=======
+
 
 Requisitos
 

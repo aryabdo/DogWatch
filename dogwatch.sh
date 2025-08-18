@@ -17,6 +17,7 @@ log() {
 }
 require_root() { if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then echo "Este script deve ser executado como root."; exit 1; fi; }
 get_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+docker_running() { command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; }
 
 # ------------- Firewall detection -------------
 detect_firewalls() {
@@ -108,6 +109,9 @@ load_env() {
   export EMERGENCY_TTL_HOURS
 
   detect_firewalls
+  if docker_running; then
+    FIREWALLS="$(echo $FIREWALLS | tr ' ' '\n' | grep -v '^iptables$' | tr '\n' ' ')"
+  fi
   mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$LOG_DIR" "$STATE_DIR"
   chmod 700 "$DATA_DIR" "$BACKUP_DIR" "$STATE_DIR" || true
 }
@@ -241,8 +245,10 @@ EOF
         if systemctl is-active --quiet firewalld 2>/dev/null; then firewall-cmd --remove-port="$EMERGENCY_SSH_PORT/tcp" --permanent 2>/dev/null || true; firewall-cmd --reload 2>/dev/null || true; fi ;;
       nftables) command -v nft >/dev/null 2>&1 && nft flush chain inet dogwatch input 2>/dev/null || true ;;
       iptables)
-        command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p tcp --dport "$EMERGENCY_SSH_PORT" -j ACCEPT 2>/dev/null || true
-        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true ;;
+        if ! docker_running && command -v iptables >/dev/null 2>&1; then
+          iptables -D INPUT -p tcp --dport "$EMERGENCY_SSH_PORT" -j ACCEPT 2>/dev/null || true
+          command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+        fi ;;
     esac
   done
   ensure_ports_open "$PRIMARY_SSH_PORT"
@@ -365,7 +371,7 @@ salvage_open_ports() {
     local p; for p in $ports; do nft list chain inet dogwatch input 2>/dev/null | grep -qw "tcp dport $p accept" || nft add rule inet dogwatch input tcp dport "$p" accept >/dev/null 2>&1 || true; done
     nft -f /etc/nftables.conf >/dev/null 2>&1 || true
   fi
-  if command -v iptables >/dev/null 2>&1; then
+  if ! docker_running && command -v iptables >/dev/null 2>&1; then
     local p; for p in $ports; do iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT || true; done
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
   fi
@@ -616,10 +622,16 @@ backup_items_list() {
 /etc/ufw
 /etc/firewalld
 /etc/nftables.conf
+EOF
+  if ! docker_running; then
+    cat <<'EOF'
 /etc/iptables
 /etc/iptables.rules
 /etc/iptables/rules.v4
 /etc/iptables/rules.v6
+EOF
+  fi
+  cat <<'EOF'
 /etc/fail2ban
 /etc/hosts.allow
 /etc/hosts.deny
@@ -637,19 +649,19 @@ backup_items_list() {
 EOF
 }
 snapshot_commands() {
-  cat <<'EOF'
-ip a
-ip r
-ss -lntup
-$SYSCTL_BIN -a
-LC_ALL=C LANG=C ufw status verbose || true
-nft list ruleset || true
-iptables-save || true
-systemctl status ssh --no-pager || true
-systemctl status ufw --no-pager || true
-systemctl status firewalld --no-pager || true
-systemctl status wg-quick@* --no-pager || true
-EOF
+  echo "ip a"
+  echo "ip r"
+  echo "ss -lntup"
+  echo "$SYSCTL_BIN -a"
+  echo "LC_ALL=C LANG=C ufw status verbose || true"
+  echo "nft list ruleset || true"
+  if ! docker_running; then
+    echo "iptables-save || true"
+  fi
+  echo "systemctl status ssh --no-pager || true"
+  echo "systemctl status ufw --no-pager || true"
+  echo "systemctl status firewalld --no-pager || true"
+  echo "systemctl status wg-quick@* --no-pager || true"
 }
 backup_snapshot() {
   require_root; load_env
@@ -728,7 +740,14 @@ compute_current_hash() {
     [[ -z "$item" ]] && continue
     if [[ -e "$item" ]]; then find "$item" -type f -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null; fi
   done < <(backup_items_list) >> "$tmp" 2>/dev/null || true
-  { LC_ALL=C LANG=C ufw status verbose 2>/dev/null || true; nft list ruleset 2>/dev/null || true; iptables-save 2>/dev/null || true; ss -lntup 2>/dev/null || true; ip a 2>/dev/null || true; ip r 2>/dev/null || true; } >> "$tmp" 2>/dev/null
+  {
+    LC_ALL=C LANG=C ufw status verbose 2>/dev/null || true
+    nft list ruleset 2>/dev/null || true
+    if ! docker_running; then iptables-save 2>/dev/null || true; fi
+    ss -lntup 2>/dev/null || true
+    ip a 2>/dev/null || true
+    ip r 2>/dev/null || true
+  } >> "$tmp" 2>/dev/null
   sha256sum "$tmp" | awk '{print $1}'; rm -f "$tmp"
 }
 reset_remote_access() {
