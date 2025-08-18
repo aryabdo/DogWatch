@@ -1016,6 +1016,69 @@ menu_replace_backups_and_lastgood() {
   say "Backups recriados e last_good.hash atualizado."
 }
 
+# ------------- Docker helpers -------------
+docker_install() {
+  require_root
+  say "Instalando Docker e Docker Compose..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y docker.io docker-compose-plugin >/dev/null 2>&1 || true
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  say "Docker instalado."
+}
+
+docker_uninstall() {
+  require_root
+  say "Removendo Docker e Docker Compose..."
+  systemctl disable --now docker >/dev/null 2>&1 || true
+  apt-get purge -y docker.io docker-compose-plugin >/dev/null 2>&1 || true
+  rm -rf /var/lib/docker /etc/docker >/dev/null 2>&1 || true
+  say "Docker removido."
+}
+
+docker_edit_daemon_config() {
+  require_root
+  mkdir -p /etc/docker
+  "${EDITOR:-nano}" /etc/docker/daemon.json
+  systemctl restart docker >/dev/null 2>&1 || true
+}
+
+docker_edit_compose() {
+  require_root
+  read -rp "Caminho do docker-compose.yml [/opt/dogwatch/docker-compose.yml]: " file
+  file="${file:-/opt/dogwatch/docker-compose.yml}"
+  mkdir -p "$(dirname "$file")"
+  "${EDITOR:-nano}" "$file"
+  read -rp "Executar 'docker compose up -d' nesse diretório? (s/N): " yn
+  if [[ ${yn,,} == s ]]; then
+    ( cd "$(dirname "$file")" && docker compose up -d ) || true
+  fi
+}
+
+menu_docker() {
+  require_root
+  while true; do
+    echo "Gerenciamento de Docker"
+    echo "a) Instalar Docker e Docker Compose"
+    echo "b) Desinstalar Docker e Docker Compose"
+    echo "c) Editar daemon.json"
+    echo "d) Editar docker-compose.yml"
+    echo "e) Listar containers"
+    echo "f) Remover container"
+    echo "g) Voltar"
+    read -rp "Opção: " dc
+    case "$dc" in
+      a) docker_install ; read -rp "Enter para continuar..." _ ;;
+      b) docker_uninstall ; read -rp "Enter para continuar..." _ ;;
+      c) docker_edit_daemon_config ;;
+      d) docker_edit_compose ;;
+      e) command -v docker >/dev/null 2>&1 && docker ps -a || echo "Docker não instalado"; read -rp "Enter para continuar..." _ ;;
+      f) read -rp "Nome/ID do container: " cn; command -v docker >/dev/null 2>&1 && docker rm -f "$cn" || echo "Docker não instalado"; read -rp "Enter para continuar..." _ ;;
+      g) break ;;
+      *) echo "Opção inválida" ;;
+    esac
+  done
+}
+
 # ------------- Daemon -------------
 daemon_loop() {
   require_root; load_env
@@ -1101,6 +1164,10 @@ case "${1:-}" in
   ensure-ports) ensure_ports_open ;;
   status) status_report ;;
   repair-now) ensure_ports_open; detect_external_vs_internal >/dev/null || true; attempt_restore_queue || true ;;
+  docker-install) docker_install ;;
+  docker-uninstall) docker_uninstall ;;
+  docker-config) docker_edit_daemon_config ;;
+  docker-compose) docker_edit_compose ;;
   "")
     menu() {
       require_root; load_env
@@ -1128,6 +1195,7 @@ case "${1:-}" in
 16) Resetar fila de restauração
 17) Substituir backups (10) e last_good.hash pelas configurações atuais
 18) Fechar acesso emergencial (porta 22)
+19) Gerenciar Docker e containers
 0) Sair
 ============================================================
 EOF
@@ -1234,6 +1302,7 @@ EOF
           16) menu_reset_restore_queue; read -rp "Enter para continuar..." _ ;;
           17) menu_replace_backups_and_lastgood; read -rp "Enter para continuar..." _ ;;
           18) ssh_set_restricted_mode; echo "Acesso emergencial fechado."; read -rp "Enter para continuar..." _ ;;
+          19) menu_docker ;;
           0) exit 0 ;;
           *) echo "Opção inválida"; sleep 1 ;;
         esac
@@ -1254,6 +1323,10 @@ Comandos:
   ensure-ports      Garante portas obrigatórias abertas
   status            Exibe diagnóstico atual com cores e serviços vinculados
   repair-now        Abre portas e tenta restauração imediatamente
+  docker-install    Instala Docker e Docker Compose
+  docker-uninstall  Remove Docker e Docker Compose
+  docker-config     Edita /etc/docker/daemon.json
+  docker-compose    Edita e aplica docker-compose.yml
   (sem argumento)   Interface interativa
 EOF
     ;;

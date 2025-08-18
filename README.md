@@ -1,4 +1,4 @@
-# DogWatch (v1.2.8)
+# DogWatch (v1.2.9)
 
 DogWatch é um daemon em Bash para evitar lockout de SSH, manter portas críticas abertas, fazer backups/instantâneos de configuração e tentar autorreparo de rede/firewall/SSH em servidores Linux com systemd.
 
@@ -23,6 +23,8 @@ Destaques
 📜 Logs claros (arquivo próprio + systemd journal).
 
 🧰 Menu interativo com operações comuns (status, logs ao vivo, backup/restore, portas, UFW, etc).
+
+🐳 Gerenciamento opcional de Docker e containers (instalar/desinstalar, editar config e docker-compose).
 
 Requisitos
 
@@ -149,7 +151,7 @@ Menu interativo
 sudo /opt/dogwatch/dogwatch.sh
 
 
-Inclui: status, logs ao vivo, backup/restore, portas, UFW (whitelist/blacklist), diagnósticos, baseline (opcional), etc.
+Inclui: status, logs ao vivo, backup/restore, portas, UFW (whitelist/blacklist), diagnósticos, Docker e baseline (opcional), etc.
 
 Logs (ao vivo)
 
@@ -221,7 +223,8 @@ Lento → aumente MONITOR_INTERVAL_SECONDS, BACKUP_INTERVAL_SECONDS, reduza PING
 
 Comandos disponíveis
 install | uninstall | daemon | backup-now | list-backups | restore <snap> |
-ensure-ports | status | repair-now | (sem argumento => menu interativo)
+ensure-ports | status | repair-now | docker-install | docker-uninstall |
+docker-config | docker-compose | (sem argumento => menu interativo)
 
 Licença
 
