@@ -17,6 +17,7 @@ log() {
 }
 require_root() { if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then echo "Este script deve ser executado como root."; exit 1; fi; }
 get_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
+docker_running() { command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; }
 
 # ------------- Firewall detection -------------
 detect_firewalls() {
@@ -108,6 +109,9 @@ load_env() {
   export EMERGENCY_TTL_HOURS
 
   detect_firewalls
+  if docker_running; then
+    FIREWALLS="$(echo $FIREWALLS | tr ' ' '\n' | grep -v '^iptables$' | tr '\n' ' ')"
+  fi
   mkdir -p "$DATA_DIR" "$BACKUP_DIR" "$LOG_DIR" "$STATE_DIR"
   chmod 700 "$DATA_DIR" "$BACKUP_DIR" "$STATE_DIR" || true
 }
@@ -241,8 +245,10 @@ EOF
         if systemctl is-active --quiet firewalld 2>/dev/null; then firewall-cmd --remove-port="$EMERGENCY_SSH_PORT/tcp" --permanent 2>/dev/null || true; firewall-cmd --reload 2>/dev/null || true; fi ;;
       nftables) command -v nft >/dev/null 2>&1 && nft flush chain inet dogwatch input 2>/dev/null || true ;;
       iptables)
-        command -v iptables >/dev/null 2>&1 && iptables -D INPUT -p tcp --dport "$EMERGENCY_SSH_PORT" -j ACCEPT 2>/dev/null || true
-        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true ;;
+        if ! docker_running && command -v iptables >/dev/null 2>&1; then
+          iptables -D INPUT -p tcp --dport "$EMERGENCY_SSH_PORT" -j ACCEPT 2>/dev/null || true
+          command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
+        fi ;;
     esac
   done
   ensure_ports_open "$PRIMARY_SSH_PORT"
@@ -365,7 +371,7 @@ salvage_open_ports() {
     local p; for p in $ports; do nft list chain inet dogwatch input 2>/dev/null | grep -qw "tcp dport $p accept" || nft add rule inet dogwatch input tcp dport "$p" accept >/dev/null 2>&1 || true; done
     nft -f /etc/nftables.conf >/dev/null 2>&1 || true
   fi
-  if command -v iptables >/dev/null 2>&1; then
+  if ! docker_running && command -v iptables >/dev/null 2>&1; then
     local p; for p in $ports; do iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport "$p" -j ACCEPT || true; done
     command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true
   fi
@@ -616,10 +622,16 @@ backup_items_list() {
 /etc/ufw
 /etc/firewalld
 /etc/nftables.conf
+EOF
+  if ! docker_running; then
+    cat <<'EOF'
 /etc/iptables
 /etc/iptables.rules
 /etc/iptables/rules.v4
 /etc/iptables/rules.v6
+EOF
+  fi
+  cat <<'EOF'
 /etc/fail2ban
 /etc/hosts.allow
 /etc/hosts.deny
@@ -637,19 +649,19 @@ backup_items_list() {
 EOF
 }
 snapshot_commands() {
-  cat <<'EOF'
-ip a
-ip r
-ss -lntup
-$SYSCTL_BIN -a
-LC_ALL=C LANG=C ufw status verbose || true
-nft list ruleset || true
-iptables-save || true
-systemctl status ssh --no-pager || true
-systemctl status ufw --no-pager || true
-systemctl status firewalld --no-pager || true
-systemctl status wg-quick@* --no-pager || true
-EOF
+  echo "ip a"
+  echo "ip r"
+  echo "ss -lntup"
+  echo "$SYSCTL_BIN -a"
+  echo "LC_ALL=C LANG=C ufw status verbose || true"
+  echo "nft list ruleset || true"
+  if ! docker_running; then
+    echo "iptables-save || true"
+  fi
+  echo "systemctl status ssh --no-pager || true"
+  echo "systemctl status ufw --no-pager || true"
+  echo "systemctl status firewalld --no-pager || true"
+  echo "systemctl status wg-quick@* --no-pager || true"
 }
 backup_snapshot() {
   require_root; load_env
@@ -728,7 +740,14 @@ compute_current_hash() {
     [[ -z "$item" ]] && continue
     if [[ -e "$item" ]]; then find "$item" -type f -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null; fi
   done < <(backup_items_list) >> "$tmp" 2>/dev/null || true
-  { LC_ALL=C LANG=C ufw status verbose 2>/dev/null || true; nft list ruleset 2>/dev/null || true; iptables-save 2>/dev/null || true; ss -lntup 2>/dev/null || true; ip a 2>/dev/null || true; ip r 2>/dev/null || true; } >> "$tmp" 2>/dev/null
+  {
+    LC_ALL=C LANG=C ufw status verbose 2>/dev/null || true
+    nft list ruleset 2>/dev/null || true
+    if ! docker_running; then iptables-save 2>/dev/null || true; fi
+    ss -lntup 2>/dev/null || true
+    ip a 2>/dev/null || true
+    ip r 2>/dev/null || true
+  } >> "$tmp" 2>/dev/null
   sha256sum "$tmp" | awk '{print $1}'; rm -f "$tmp"
 }
 reset_remote_access() {
@@ -1016,6 +1035,69 @@ menu_replace_backups_and_lastgood() {
   say "Backups recriados e last_good.hash atualizado."
 }
 
+# ------------- Docker helpers -------------
+docker_install() {
+  require_root
+  say "Instalando Docker e Docker Compose..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y docker.io docker-compose-plugin >/dev/null 2>&1 || true
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  say "Docker instalado."
+}
+
+docker_uninstall() {
+  require_root
+  say "Removendo Docker e Docker Compose..."
+  systemctl disable --now docker >/dev/null 2>&1 || true
+  apt-get purge -y docker.io docker-compose-plugin >/dev/null 2>&1 || true
+  rm -rf /var/lib/docker /etc/docker >/dev/null 2>&1 || true
+  say "Docker removido."
+}
+
+docker_edit_daemon_config() {
+  require_root
+  mkdir -p /etc/docker
+  "${EDITOR:-nano}" /etc/docker/daemon.json
+  systemctl restart docker >/dev/null 2>&1 || true
+}
+
+docker_edit_compose() {
+  require_root
+  read -rp "Caminho do docker-compose.yml [/opt/dogwatch/docker-compose.yml]: " file
+  file="${file:-/opt/dogwatch/docker-compose.yml}"
+  mkdir -p "$(dirname "$file")"
+  "${EDITOR:-nano}" "$file"
+  read -rp "Executar 'docker compose up -d' nesse diretório? (s/N): " yn
+  if [[ ${yn,,} == s ]]; then
+    ( cd "$(dirname "$file")" && docker compose up -d ) || true
+  fi
+}
+
+menu_docker() {
+  require_root
+  while true; do
+    echo "Gerenciamento de Docker"
+    echo "a) Instalar Docker e Docker Compose"
+    echo "b) Desinstalar Docker e Docker Compose"
+    echo "c) Editar daemon.json"
+    echo "d) Editar docker-compose.yml"
+    echo "e) Listar containers"
+    echo "f) Remover container"
+    echo "g) Voltar"
+    read -rp "Opção: " dc
+    case "$dc" in
+      a) docker_install ; read -rp "Enter para continuar..." _ ;;
+      b) docker_uninstall ; read -rp "Enter para continuar..." _ ;;
+      c) docker_edit_daemon_config ;;
+      d) docker_edit_compose ;;
+      e) command -v docker >/dev/null 2>&1 && docker ps -a || echo "Docker não instalado"; read -rp "Enter para continuar..." _ ;;
+      f) read -rp "Nome/ID do container: " cn; command -v docker >/dev/null 2>&1 && docker rm -f "$cn" || echo "Docker não instalado"; read -rp "Enter para continuar..." _ ;;
+      g) break ;;
+      *) echo "Opção inválida" ;;
+    esac
+  done
+}
+
 # ------------- Daemon -------------
 daemon_loop() {
   require_root; load_env
@@ -1101,6 +1183,10 @@ case "${1:-}" in
   ensure-ports) ensure_ports_open ;;
   status) status_report ;;
   repair-now) ensure_ports_open; detect_external_vs_internal >/dev/null || true; attempt_restore_queue || true ;;
+  docker-install) docker_install ;;
+  docker-uninstall) docker_uninstall ;;
+  docker-config) docker_edit_daemon_config ;;
+  docker-compose) docker_edit_compose ;;
   "")
     menu() {
       require_root; load_env
@@ -1128,6 +1214,7 @@ case "${1:-}" in
 16) Resetar fila de restauração
 17) Substituir backups (10) e last_good.hash pelas configurações atuais
 18) Fechar acesso emergencial (porta 22)
+19) Gerenciar Docker e containers
 0) Sair
 ============================================================
 EOF
@@ -1234,6 +1321,7 @@ EOF
           16) menu_reset_restore_queue; read -rp "Enter para continuar..." _ ;;
           17) menu_replace_backups_and_lastgood; read -rp "Enter para continuar..." _ ;;
           18) ssh_set_restricted_mode; echo "Acesso emergencial fechado."; read -rp "Enter para continuar..." _ ;;
+          19) menu_docker ;;
           0) exit 0 ;;
           *) echo "Opção inválida"; sleep 1 ;;
         esac
@@ -1254,6 +1342,10 @@ Comandos:
   ensure-ports      Garante portas obrigatórias abertas
   status            Exibe diagnóstico atual com cores e serviços vinculados
   repair-now        Abre portas e tenta restauração imediatamente
+  docker-install    Instala Docker e Docker Compose
+  docker-uninstall  Remove Docker e Docker Compose
+  docker-config     Edita /etc/docker/daemon.json
+  docker-compose    Edita e aplica docker-compose.yml
   (sem argumento)   Interface interativa
 EOF
     ;;
