@@ -20,11 +20,13 @@ Destaques
 
 🧷 IP fixo resiliente: restaura netplan de backup com rollback automático.
 
+🔄 Rollback condicional: alterações são mantidas e só revertidas se a conectividade interna ou externa falhar.
+
 📜 Logs claros (arquivo próprio + systemd journal).
 
 🧰 Menu interativo com operações comuns (status, logs ao vivo, backup/restore, portas, UFW, etc).
 
-🐳 Gerenciamento opcional de Docker e containers (instalar/desinstalar, editar config e docker-compose) sem monitorar ou alterar regras do Docker.
+🐳 Gerenciamento opcional de Docker e containers (instalar/desinstalar, editar config e docker-compose) sem monitorar ou alterar regras do Docker; mudanças de rede dos containers são preservadas enquanto a conectividade permanecer funcional.
 =======
 
 
@@ -95,6 +97,9 @@ AUTO_RESTORE_FIXED_IP=1
 FIXED_IP_RESTORE_MIN_INTERVAL=900
 NETPLAN_RESTORE_REVERT_SECONDS=180
 # INTERFACE_WATCH="" # defina para vigiar uma interface específica
+
+# Alterações do Docker na rede/firewall
+ALLOW_DOCKER_CHANGES=1       # rollback só se conectividade cair
 
 # Portas obrigatórias e extras
 MANDATORY_OPEN_PORTS="16309"
