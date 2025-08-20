@@ -74,6 +74,7 @@ load_env() {
 
   export FIREWALLS="${FIREWALLS:-"ufw firewalld nftables iptables"}"
   export AGGRESSIVE_REPAIR="${AGGRESSIVE_REPAIR:-1}"
+  export ALLOW_DOCKER_CHANGES="${ALLOW_DOCKER_CHANGES:-1}"
 
   export CURL_BIN="${CURL_BIN:-$(command -v curl || echo /usr/bin/curl)}"
   export NC_BIN="${NC_BIN:-$(command -v nc || echo /usr/bin/nc)}"
@@ -360,6 +361,8 @@ firewall_allows_ports() {
 
 # salva-vidas multi-camada (evita lockout)
 salvage_open_ports() {
+  load_env
+  [[ "${ALLOW_DOCKER_CHANGES:-0}" == "1" ]] && { log INFO "ALLOW_DOCKER_CHANGES=1; pulando salvage_open_ports"; return 0; }
   local ports="$(echo $*)"
   if command -v ufw >/dev/null 2>&1; then
     LC_ALL=C LANG=C ufw --force enable >/dev/null 2>&1 || true
@@ -380,6 +383,7 @@ salvage_open_ports() {
 _ENSURE_PORTS_GUARD=0
 ensure_ports_open() {
   load_env
+  [[ "${ALLOW_DOCKER_CHANGES:-0}" == "1" ]] && { log INFO "ALLOW_DOCKER_CHANGES=1; pulando ensure_ports_open"; return 0; }
   local ports="${*:-${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}}"; ports="$(echo $ports)"
   [[ "${_ENSURE_PORTS_GUARD:-0}" == "1" ]] && { log DEBUG "ensure_ports_open guard ativo"; return 0; }
   _ENSURE_PORTS_GUARD=1
@@ -414,6 +418,8 @@ ensure_ports_open() {
   _ENSURE_PORTS_GUARD=0
 }
 safe_disable_firewalls() {
+  load_env
+  [[ "${ALLOW_DOCKER_CHANGES:-0}" == "1" ]] && { log INFO "ALLOW_DOCKER_CHANGES=1; pulando safe_disable_firewalls"; return 0; }
   local fw
   for fw in $FIREWALLS; do
     case "$fw" in
@@ -437,6 +443,7 @@ safe_disable_firewalls() {
 }
 post_firewall_apply_verify() {
   load_env
+  [[ "${ALLOW_DOCKER_CHANGES:-0}" == "1" ]] && { log INFO "ALLOW_DOCKER_CHANGES=1; pulando verificação pós-firewall"; return 0; }
   local ports="$(echo "${MANDATORY_OPEN_PORTS} ${EXTRA_PORTS}")"
   if listening_on_ports $ports >/dev/null 2>&1; then
     has_remote_access; local rc=$?
@@ -474,6 +481,7 @@ EOF
 }
 enforce_single_firewall() {
   load_env
+  [[ "${ALLOW_DOCKER_CHANGES:-0}" == "1" ]] && { log INFO "ALLOW_DOCKER_CHANGES=1; pulando enforce_single_firewall"; return 0; }
   case "${ENFORCE_SINGLE_FIREWALL:-ufw}" in
     ufw)
       systemctl stop firewalld >/dev/null 2>&1 || true; systemctl disable firewalld >/dev/null 2>&1 || true; systemctl mask firewalld >/dev/null 2>&1 || true
@@ -707,6 +715,11 @@ restore_snapshot() {
   local snap="$1"; local dir="$BACKUP_DIR/$snap"
   if [[ ! -d "$dir" ]]; then echo "Snapshot não encontrado: $snap"; exit 1; fi
   log INFO "Restaurando snapshot: $snap"
+  if [[ "${ALLOW_DOCKER_CHANGES:-0}" == "1" ]]; then
+    rsync -a --exclude '/etc/netplan/' "$dir/files"/ / 2>/dev/null || true
+    log INFO "Snapshot restaurado sem alterações de firewall ou netplan"
+    return 0
+  fi
   safe_disable_firewalls
   rsync -a "$dir/files"/ / 2>/dev/null || true
 
@@ -761,17 +774,19 @@ EOF
   : > /etc/hosts.deny || true
   command -v fail2ban-client >/dev/null 2>&1 && fail2ban-client unban --all || true
   command -v passwd >/dev/null 2>&1 && passwd -u root 2>/dev/null || true
-  local fw
-  for fw in $FIREWALLS; do
-    case "$fw" in
-      ufw) command -v ufw >/dev/null 2>&1 && LC_ALL=C LANG=C ufw --force reset || true ;;
-      firewalld)
-        if systemctl is-active --quiet firewalld 2>/dev/null; then firewall-cmd --permanent --delete-all-rich-rules 2>/dev/null || true; firewall-cmd --permanent --delete-all-rules 2>/dev/null || true; firewall-cmd --reload 2>/dev/null || true; fi ;;
-      nftables) command -v nft >/dev/null 2>&1 && nft flush chain inet dogwatch input 2>/dev/null || true ;;
-      iptables)
-        if command -v iptables >/dev/null 2>&1; then iptables -P INPUT ACCEPT 2>/dev/null || true; iptables -F 2>/dev/null || true; command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true; fi ;;
-    esac
-  done
+  if [[ "${ALLOW_DOCKER_CHANGES:-0}" != "1" ]]; then
+    local fw
+    for fw in $FIREWALLS; do
+      case "$fw" in
+        ufw) command -v ufw >/dev/null 2>&1 && LC_ALL=C LANG=C ufw --force reset || true ;;
+        firewalld)
+          if systemctl is-active --quiet firewalld 2>/dev/null; then firewall-cmd --permanent --delete-all-rich-rules 2>/dev/null || true; firewall-cmd --permanent --delete-all-rules 2>/dev/null || true; firewall-cmd --reload 2>/dev/null || true; fi ;;
+        nftables) command -v nft >/dev/null 2>&1 && nft flush chain inet dogwatch input 2>/dev/null || true ;;
+        iptables)
+          if command -v iptables >/dev/null 2>&1; then iptables -P INPUT ACCEPT 2>/dev/null || true; iptables -F 2>/dev/null || true; command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1 || true; fi ;;
+      esac
+    done
+  fi
   salvage_open_ports "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT"
   ssh_safe_reload || true
 }
@@ -928,13 +943,24 @@ setup_restore_queue() {
   echo 0 > "$STATE_DIR/restore_index"
 }
 attempt_restore_queue() {
-  load_env; [[ -f "$STATE_DIR/restore_queue.txt" ]] || setup_restore_queue
-  local idx total snap; idx="$(cat "$STATE_DIR/restore_index" 2>/dev/null || echo 0)"; total="$(wc -l < "$STATE_DIR/restore_queue.txt")"
-  if (( idx >= total )); then log WARN "Fila de restauração esgotada."; rm -f "$STATE_DIR/restore_queue.txt" "$STATE_DIR/restore_index"; return 1; fi
+  load_env
+  connectivity_healthy && { log INFO "Conectividade saudável; rollback não necessário"; return 0; }
+  [[ -f "$STATE_DIR/pending.hash" ]] || { log INFO "Sem alterações pendentes; rollback ignorado"; return 0; }
+  [[ -f "$STATE_DIR/restore_queue.txt" ]] || setup_restore_queue
+  local idx total snap
+  idx="$(cat "$STATE_DIR/restore_index" 2>/dev/null || echo 0)"
+  total="$(wc -l < "$STATE_DIR/restore_queue.txt")"
+  if (( idx >= total )); then
+    log WARN "Fila de restauração esgotada."; rm -f "$STATE_DIR/restore_queue.txt" "$STATE_DIR/restore_index"; return 1
+  fi
   snap="$(sed -n "$((idx+1))p" "$STATE_DIR/restore_queue.txt")"
   log INFO "Tentando restauração: $snap"
-  if [[ "$snap" == "000-initial" && "$EMERGENCY_WINDOW_ON_000" == "1" ]]; then ssh_set_permissive_mode "000-initial" || true; salvage_open_ports "$PRIMARY_SSH_PORT $RESTORE_EMERGENCY_PORTS $EMERGENCY_SSH_PORT"
-  else salvage_open_ports "$RESTORE_EMERGENCY_PORTS"; fi
+  if [[ "$snap" == "000-initial" && "$EMERGENCY_WINDOW_ON_000" == "1" ]]; then
+    ssh_set_permissive_mode "000-initial" || true
+    salvage_open_ports "$PRIMARY_SSH_PORT $RESTORE_EMERGENCY_PORTS $EMERGENCY_SSH_PORT"
+  else
+    salvage_open_ports "$RESTORE_EMERGENCY_PORTS"
+  fi
   echo $((idx+1)) > "$STATE_DIR/restore_index"
   restore_snapshot "$snap"
 }
@@ -1151,6 +1177,7 @@ daemon_loop() {
             salvage_open_ports "$PRIMARY_SSH_PORT $EMERGENCY_SSH_PORT $EXTRA_PORTS"; ssh_set_permissive_mode "remote-only-failure"; echo 0 > "$pf"
           fi
         fi
+        [[ "${AGGRESSIVE_REPAIR:-1}" == "1" ]] && attempt_restore_queue || true
         ;;
       internal)
         echo 0 > "$STATE_DIR/normal_streak"
